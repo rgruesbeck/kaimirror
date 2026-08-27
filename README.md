@@ -64,60 +64,96 @@ Key names: digits `0`–`9`, `UP` `DOWN` `LEFT` `RIGHT`, `OK`, `BACK`, `MENU`,
 
 ## Performance — read this before expecting scrcpy
 
-**~1.5–4 fps end to end, depending on what is on screen.** This is a slideshow,
-not smooth video. It is fine for watching a UI flow, debugging a layout or
-recording a repro; it is not fine for anything motion-heavy.
-
-The rate is content-dependent because every frame is a full PNG encode plus a
-flash round trip, and both scale with how well the screen compresses:
+**~6 fps end to end on flat UI, less on busy screens.** This is a fast
+slideshow, not smooth video. It is fine for watching a UI flow, debugging a
+layout or recording a repro; it is not fine for anything motion-heavy.
 
 | Screen content | PNG size | Observed |
 |---|---|---|
-| Animated lock-screen wallpaper | ~66 KB/frame | **~1.6 fps** |
-| App grid / menus / mostly-flat UI | ~11–31 KB/frame | **~3.5–3.7 fps** |
+| App grid / menus / mostly-flat UI | ~11–31 KB/frame | **~6.0–6.4 fps** |
+| Animated lock-screen wallpaper | ~66 KB/frame | lower — encode and transfer both scale with frame size |
 
-Other measurements on the test device:
+### Where the time actually goes
 
-- capture alone (no transfer): **~80 ms/frame ≈ 12 fps** — the ceiling
-- adb transfer: 9 MB/s (`exec-out`) / 30 MB/s (`pull`) — *not* the bottleneck
-- fork+exec: ~6 ms — *not* the bottleneck either
+The bottleneck is **process startup**, not capture, not PNG encoding, and not
+flash. Every external command on this device costs ~34 ms:
 
-The cost is the per-frame round trip through the filesystem: `b2g` PNG-encodes
-240x320 and writes it to `/data` flash, then the shell renames, stats and reads
-it back. Two notes that cost real time to discover:
+| | ms/call |
+|---|---|
+| shell builtin (`true`) | 1.4 |
+| `stat` / `od` / `tail` (toybox) | 33.7 / 35.8 / 33.9 |
+| `gfxdebugger`, usage only (no capture) | 34.5 |
+| `gfxdebugger -c screencap` | 75.0 |
+
+So the capture itself is only ~41 ms of that 75 ms — the other ~34 ms is fork,
+exec and dynamic linking. **The real capture ceiling is ~24 fps, not 12.**
+
+An earlier serial design ran six external commands per frame and spent ~205 ms
+of every 314 ms frame in process startup alone:
+
+| Stage | ms |
+|---|---|
+| `gfxdebugger` call | 108 |
+| wait-for-`IEND` (even at zero polls — the check itself) | 71 |
+| `mv` + `stat` + `cat` | 134 |
+| **total** | **314 → 3.2 fps** |
+
+Hence the current pump's shape: **pipeline the capture and remove every fork
+that can be removed.** The capture for frame N+1 is issued *before* frame N is
+shipped, so b2g's encode overlaps the transfer, and framing moved to the host
+so no `stat` is needed. That is 4 forks per frame instead of 6, and it roughly
+doubles throughput (3.9 → 6.0–6.4 fps measured end to end).
+
+Two more things that cost real time to discover:
 
 - **Do not busy-spin while waiting for the frame.** A tight poll loop steals CPU
-  from b2g's PNG encoder and makes things *slower*: 0 µs poll delay → 10 fps
-  capture, 30000 µs → 12 fps. Hence the `usleep` in the device script.
+  from b2g's PNG encoder. With the pipeline the wait almost always succeeds on
+  the first check, so the `usleep` is now 5000 µs rather than 30000 µs.
 - The screen must be awake. A blanked panel captures as a valid 303-byte solid
   black PNG, which looks like success. `view`/`record`/`shot` tap power first
-  unless you pass `--no-wake`.
+  unless you pass `--no-wake`. Note that power *toggles* — if the panel was
+  already lit, `wake` turns it off.
 
-### The two races this design defends against
+Other measurements: adb transfer is 9 MB/s (`exec-out`) / 30 MB/s (`pull`) —
+*not* the bottleneck.
 
-`gfxdebugger` returns immediately; `b2g` finishes the PNG **asynchronously**.
+### The race this design defends against
 
-1. **Truncated reads.** The file grows in 8192-byte chunks, so a naive read gets
-   a valid-looking PNG with no `IEND`. The device script waits for the `IEND`
-   chunk before touching the file.
-2. **Size/content skew.** Stat'ing the size *before* confirming `IEND` pairs a
-   partial size with a complete file and desyncs the stream permanently. Size is
-   read only after `IEND`, and the frame is renamed away first so a late writer
-   can never truncate the copy being sent.
+`gfxdebugger` returns as soon as b2g **accepts** the request; b2g encodes and
+writes the PNG asynchronously. The reply is a 4-byte parcel: `0` = accepted,
+`1` = rejected. `0` does *not* mean the file was written — capturing to an
+unwritable path also returns `0`. Only a bad display id is rejected
+synchronously.
 
-Wire format is `"FRAME" + %010d size + <size> PNG bytes`.
+Measured back to back, **23 of 40 frames were still incomplete when
+`gfxdebugger` returned** (with a pause between captures, none were). So the
+guard is real and necessary: the device script waits for the PNG `IEND` chunk,
+then renames the frame away before sending it, so a late writer can never
+truncate the copy in flight.
+
+Wire format is a stream of back-to-back PNGs with no length prefix — length
+framing would cost a `stat` fork per frame. The host walks the PNG chunk
+headers to find each `IEND`, which also lets it resynchronise on the next
+signature instead of dying if the stream is ever damaged.
 
 ## Making it faster
 
-The ceiling here is the shell pipeline, not the hardware. The scrcpy-shaped fix
-is the one scrcpy itself uses: push a small native binary that speaks
-`/dev/socket/gfxdebugger-ipc` directly and streams frames over a socket,
-skipping the PNG-to-flash round trip entirely. That needs an NDK cross-compile
-and reverse-engineering the IPC parcel format (the binary's strings show a
-`parcel size` / `received %zu bytes` protocol). Expect roughly the 12 fps
-capture ceiling if done.
+Two dead ends, both tested on the device:
+
+- **Let b2g write straight into a FIFO**, skipping the file entirely: rejected
+  synchronously (`result: 1`, zero bytes). b2g requires a regular file.
+- **Stage frames on tmpfs** instead of flash: `mount` is denied even as root
+  under SELinux. It would not have helped anyway — flash is not the cost.
+
+What is left is the scrcpy-shaped fix: push a small native binary that speaks
+`/dev/socket/gfxdebugger-ipc` directly and streams frames over a socket. The
+win is not skipping flash, it is collapsing every per-frame fork into one
+long-lived process. That needs an NDK cross-compile and the IPC parcel format
+(`gfxdebugger` is a 15 KB stripped ARM32 binary using `android::Parcel`
+`writeUint32`/`writeCString`/`readUint32` over a unix socket). Expect
+something near the ~24 fps capture ceiling if done.
 
 ## Files
 
 - `kaimirror.py` — host-side CLI and frame-stream reader
-- `kaimirror_device.sh` — device-side frame pump, pushed to `/data/local/tmp`
+- `kaimirror_device.sh` — device-side frame pump (pipelined), pushed to `/data/local/tmp`

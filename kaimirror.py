@@ -25,8 +25,8 @@ import time
 DEVICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
-HEADER = b"FRAME"
-HEADER_LEN = len(HEADER) + 10
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+MAX_CHUNK = 1 << 24     # anything larger is garbage, not a 240x320 frame
 
 # Linux input event codes, per `getevent -pl` on the device.
 # matrix-keypad (event1) carries the whole keypad; the power/volume keys live
@@ -91,31 +91,71 @@ def wake():
 
 
 class FrameStream:
-    """Reads the framed PNG stream produced by kaimirror_device.sh."""
+    """Reads the PNG stream produced by kaimirror_device.sh.
 
-    def __init__(self, delay_us=30000, display=0):
+    The device sends back-to-back PNGs with no length prefix -- framing them
+    device-side would cost a `stat` fork per frame, and forks are the pump's
+    dominant cost.  So we walk the PNG chunk headers to find each IEND, which
+    is free here and self-synchronising: if the stream is ever damaged we scan
+    forward to the next signature rather than dying.
+    """
+
+    def __init__(self, delay_us=5000, display=0):
         self.proc = subprocess.Popen(
             ["adb", "exec-out", "sh", REMOTE_SCRIPT, str(delay_us), str(display)],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.buf = b""
+        self.pos = 8        # chunk-walk offset within the frame being parsed
 
-    def _read_exact(self, n):
-        while len(self.buf) < n:
-            chunk = self.proc.stdout.read(65536)
-            if not chunk:
-                return None
-            self.buf += chunk
-        out, self.buf = self.buf[:n], self.buf[n:]
-        return out
+    def _fill(self):
+        # read1() returns as soon as bytes are available; read() would block
+        # for the full request and add a frame of latency.
+        chunk = self.proc.stdout.read1(65536)
+        if not chunk:
+            return False
+        self.buf += chunk
+        return True
+
+    def _next_png(self):
+        while True:
+            if len(self.buf) < 8:
+                if not self._fill():
+                    return None
+                continue
+            if not self.buf.startswith(PNG_SIG):
+                j = self.buf.find(PNG_SIG, 1)
+                if j < 0:
+                    self.buf = self.buf[-(len(PNG_SIG) - 1):]
+                    if not self._fill():
+                        return None
+                else:
+                    self.buf = self.buf[j:]
+                self.pos = 8
+                continue
+            if self.pos + 8 > len(self.buf):
+                if not self._fill():
+                    return None
+                continue
+            length = int.from_bytes(self.buf[self.pos:self.pos + 4], "big")
+            ctype = self.buf[self.pos + 4:self.pos + 8]
+            if length > MAX_CHUNK or not ctype.isalpha():
+                self.buf = self.buf[1:]     # not a real header; resync
+                self.pos = 8
+                continue
+            end = self.pos + 8 + length + 4
+            if end > len(self.buf):
+                if not self._fill():
+                    return None
+                continue
+            if ctype == b"IEND":
+                png, self.buf = self.buf[:end], self.buf[end:]
+                self.pos = 8
+                return png
+            self.pos = end
 
     def frames(self):
         while True:
-            head = self._read_exact(HEADER_LEN)
-            if head is None:
-                return
-            if not head.startswith(HEADER):
-                raise RuntimeError(f"stream desync, got {head[:16]!r}")
-            png = self._read_exact(int(head[len(HEADER):]))
+            png = self._next_png()
             if png is None:
                 return
             yield png
@@ -204,8 +244,8 @@ def cmd_wake(a):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--poll-delay", type=int, default=30000,
-                   help="device-side inter-poll usleep in us (default 30000)")
+    p.add_argument("--poll-delay", type=int, default=5000,
+                   help="device-side inter-poll usleep in us (default 5000)")
     p.add_argument("--display", type=int, default=0,
                    help="0=primary (default), 1=external/cover")
     p.add_argument("--no-wake", action="store_true",
@@ -214,12 +254,12 @@ def main():
 
     v = sub.add_parser("view", help="live mirror in an ffplay window")
     v.add_argument("--scale", type=float, default=2.0)
-    v.add_argument("--fps", type=int, default=4)
+    v.add_argument("--fps", type=int, default=6)
     v.set_defaults(func=cmd_view)
 
     r = sub.add_parser("record", help="record the screen to a video file")
     r.add_argument("output")
-    r.add_argument("--fps", type=int, default=4)
+    r.add_argument("--fps", type=int, default=6)
     r.set_defaults(func=cmd_record)
 
     s = sub.add_parser("shot", help="save a single screenshot")
