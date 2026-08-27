@@ -50,23 +50,31 @@ from the framework.
 
 ## Usage
 
+`./kaimirror.py --help` lists everything; each subcommand has its own `-h`.
+
 ```sh
-./kaimirror.py view                  # live mirror window (2x, nearest-neighbour)
+./kaimirror.py view                     # live mirror window (2x, nearest-neighbour)
 ./kaimirror.py view --scale 3
-./kaimirror.py record out.mp4        # Ctrl-C to finalize
+./kaimirror.py record out.mp4           # Ctrl-C to finalize
 ./kaimirror.py shot screen.png
-./kaimirror.py key DOWN OK           # inject key presses
-./kaimirror.py wake                  # tap power so the panel is lit
-./kaimirror.py --display 1 shot cover.png
-./kaimirror.py --format png view      # PNG stream: 12x less bandwidth, slower
-./kaimirror.py --no-device-guard view # ~8.8 fps, torn frames become possible
+./kaimirror.py key DOWN OK              # inject key presses
+./kaimirror.py wake                     # tap power so the panel is lit
+./kaimirror.py shot --display 1 cover.png
+./kaimirror.py view --format png        # PNG stream: 12x less bandwidth, slower
+./kaimirror.py view --no-device-guard   # ~8.8 fps, torn frames become possible
 ```
+
+The capture options (`--display`, `--poll-delay`, `--no-wake`, and for
+`view`/`record` also `--format`, `--no-device-guard`) work on either side of
+the subcommand name, so the older `./kaimirror.py --display 1 shot cover.png`
+form still works too.
 
 `view` and `record` stream uncompressed RGB565 by default; `shot` always uses
 PNG. See [Performance](#performance--read-this-before-expecting-scrcpy).
 
-Key names: digits `0`–`9`, `UP` `DOWN` `LEFT` `RIGHT`, `OK`, `BACK`, `MENU`,
-`CALL`, `STAR`, `POUND`, `SOFT_LEFT`, `SOFT_RIGHT`, `POWER`, `VOLUMEUP`,
+Key names — `./kaimirror.py key --list` prints them: digits `0`–`9`, `UP`
+`DOWN` `LEFT` `RIGHT`, `OK`/`CENTER`, `BACK`, `MENU`, `HELP`, `CALL`/`SEND`,
+`STAR`, `POUND`, `SOFT_LEFT`, `SOFT_RIGHT`, `POWER`, `VOLUMEUP`,
 `VOLUMEDOWN`, `CAMERA`.
 
 ## Performance — read this before expecting scrcpy

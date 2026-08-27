@@ -26,6 +26,8 @@ import threading
 import time
 from queue import Queue
 
+VERSION = "0.1.0"
+
 DEVICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
@@ -347,6 +349,11 @@ def cmd_shot(a):
 
 
 def cmd_key(a):
+    if a.list:
+        print("\n".join(sorted(KEYS)))
+        return
+    if not a.names:
+        sys.exit("error: give at least one key name, or --list to see them all")
     for name in a.names:
         send_key(name)
 
@@ -356,47 +363,145 @@ def cmd_wake(a):
     print(f"backlight={b}" + ("" if b else "  (still off -- press power manually)"))
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("--poll-delay", type=int, default=5000,
-                   help="device-side inter-poll usleep in us (default 5000)")
-    p.add_argument("--display", type=int, default=0,
-                   help="0=primary (default), 1=external/cover")
-    p.add_argument("--no-wake", action="store_true",
-                   help="do not tap power before streaming")
-    p.add_argument("--format", choices=("raw", "png"), default="raw",
-                   help="stream format for view/record: raw RGB565 (default, "
-                        "content-independent rate) or png (12x less bandwidth)")
-    p.add_argument("--no-device-guard", action="store_true",
-                   help="skip the device-side completeness wait and resync on "
-                        "the frame header instead: faster, but a torn frame "
-                        "becomes possible")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def positive_int(s):
+    v = int(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {s!r}")
+    return v
 
-    v = sub.add_parser("view", help="live mirror in an ffplay window")
-    v.add_argument("--scale", type=float, default=2.0)
-    v.add_argument("--fps", type=int, default=7)
-    v.set_defaults(func=cmd_view)
 
-    r = sub.add_parser("record", help="record the screen to a video file")
-    r.add_argument("output")
-    r.add_argument("--fps", type=int, default=7)
-    r.set_defaults(func=cmd_record)
+def positive_float(s):
+    v = float(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be a positive number, got {s!r}")
+    return v
 
-    s = sub.add_parser("shot", help="save a single screenshot")
-    s.add_argument("output", nargs="?", default="kaishot.png")
-    s.set_defaults(func=cmd_shot)
 
-    k = sub.add_parser("key", help="inject key presses")
-    k.add_argument("names", nargs="+")
+def capture_opts(stream, defaults=False):
+    """The shared capture options, as a parent parser.
+
+    Attached both to the top level and to each capture subcommand, so they
+    work on either side of the subcommand name.  The subcommand copies default
+    to SUPPRESS, which keeps an unset option out of the namespace entirely, so
+    they cannot overwrite a value parsed before the subcommand name; only the
+    top-level copy carries the real defaults.  The two must be built by
+    separate calls: parents= shares action *instances*, so one set_defaults
+    would rewrite both.
+    """
+    def dflt(v):
+        return v if defaults else argparse.SUPPRESS
+
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--poll-delay", type=positive_int, metavar="US",
+                   default=dflt(5000),
+                   help="device-side inter-poll usleep in us (default: 5000)")
+    p.add_argument("--display", type=int, choices=(0, 1), default=dflt(0),
+                   help="0=primary panel, 1=external/cover display "
+                        "(default: 0); geometry is read from the frame")
+    p.add_argument("--no-wake", action="store_true", default=dflt(False),
+                   help="do not tap power before capturing; a blanked panel "
+                        "captures as solid black")
+    if stream:
+        p.add_argument("--format", choices=("raw", "png"), default=dflt("raw"),
+                       help="stream format: raw RGB565 (default, "
+                            "content-independent rate) or png (12x less "
+                            "bandwidth, slower)")
+        p.add_argument("--no-device-guard", action="store_true",
+                       default=dflt(False),
+                       help="skip the device-side completeness wait and "
+                            "resync on the frame header instead: faster, but "
+                            "a torn frame becomes possible")
+    return p
+
+
+EXAMPLES = """\
+examples:
+  kaimirror view                     live mirror window (2x, nearest-neighbour)
+  kaimirror view --scale 3
+  kaimirror record out.mp4           Ctrl-C to finalize
+  kaimirror shot screen.png
+  kaimirror shot --display 1 cover.png
+  kaimirror key DOWN OK              inject key presses (key --list for names)
+  kaimirror view --format png        12x less bandwidth, painful over wifi
+  kaimirror view --no-device-guard   ~8.8 fps, torn frames become possible
+"""
+
+
+def build_parser():
+    fmt = argparse.RawDescriptionHelpFormatter
+    stream_opts = capture_opts(stream=True)
+    still_opts = capture_opts(stream=False)
+
+    p = argparse.ArgumentParser(
+        prog="kaimirror", description=__doc__, epilog=EXAMPLES,
+        formatter_class=fmt, parents=[capture_opts(True, defaults=True)])
+    p.set_defaults(capture=False)
+    p.add_argument("-V", "--version", action="version",
+                   version=f"kaimirror {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    v = sub.add_parser("view", parents=[stream_opts], formatter_class=fmt,
+                       help="live mirror in an ffplay window",
+                       description="Live mirror in an ffplay window.")
+    v.add_argument("--scale", type=positive_float, default=2.0,
+                   help="window magnification, nearest-neighbour (default: 2)")
+    v.add_argument("--fps", type=positive_int, default=7,
+                   help="rate declared to ffplay; the device delivers ~6.5 "
+                        "(default: 7)")
+    v.set_defaults(func=cmd_view, capture=True)
+
+    r = sub.add_parser("record", parents=[stream_opts], formatter_class=fmt,
+                       help="record the screen to a video file",
+                       description="Record the screen to a video file.\n"
+                                   "Ctrl-C finalizes it; an existing file is "
+                                   "overwritten.")
+    r.add_argument("output", help="output path; the extension picks the "
+                                  "container (e.g. out.mp4)")
+    r.add_argument("--fps", type=positive_int, default=7,
+                   help="rate declared to ffmpeg; the device delivers ~6.5 "
+                        "(default: 7)")
+    r.set_defaults(func=cmd_record, capture=True)
+
+    s = sub.add_parser("shot", parents=[still_opts], formatter_class=fmt,
+                       help="save a single screenshot",
+                       description="Save a single screenshot.  Always captured as PNG:\n"
+                                   "one frame is not worth optimising, and PNG keeps more\n"
+                                   "colour precision than the RGB565 raw dump.")
+    s.add_argument("output", nargs="?", default="kaishot.png",
+                   help="output path (default: kaishot.png)")
+    s.set_defaults(func=cmd_shot, capture=True)
+
+    k = sub.add_parser("key", formatter_class=fmt,
+                       help="inject key presses",
+                       description="Inject key presses via sendevent on the raw\n"
+                                   "/dev/input nodes.",
+                       epilog="key names:\n  "
+                              + "\n  ".join(", ".join(sorted(KEYS)[i:i + 8])
+                                            for i in range(0, len(KEYS), 8)))
+    k.add_argument("names", nargs="*", metavar="KEY",
+                   help="one or more key names, pressed in order")
+    k.add_argument("--list", action="store_true",
+                   help="print the known key names and exit")
     k.set_defaults(func=cmd_key)
 
-    w = sub.add_parser("wake", help="tap power to light the panel")
+    w = sub.add_parser("wake", formatter_class=fmt,
+                       help="tap power to light the panel",
+                       description="Tap power to light the panel.  Power *toggles*: if\n"
+                                   "the panel was already lit, this turns it off.")
     w.set_defaults(func=cmd_wake)
+    return p
 
+
+def main():
+    p = build_parser()
     a = p.parse_args()
+    if a.cmd is None:
+        p.print_help()
+        return
+    if a.cmd == "key" and a.list:      # nothing to talk to a device about
+        return a.func(a)
     ensure_root()
-    if a.cmd in ("view", "record", "shot"):
+    if a.capture:
         push_script()
         if not a.no_wake:
             wake()
