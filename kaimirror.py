@@ -54,13 +54,24 @@ def adb(*args, **kw):
     return subprocess.run(("adb",) + args, capture_output=True, **kw)
 
 
+def ensure_device():
+    """Fail fast if nothing is attached -- `adb wait-for-device` blocks forever."""
+    out = adb("devices").stdout.decode(errors="replace").splitlines()[1:]
+    if not any(line.split()[1:2] == ["device"] for line in out if line.strip()):
+        sys.exit("error: no device (check the cable; `adb devices` should list it)")
+
+
 def ensure_root():
+    ensure_device()
     who = adb("shell", "id").stdout.decode(errors="replace")
     if "uid=0" in who:
         return
     adb("root")
     time.sleep(2)
-    adb("wait-for-device")
+    try:
+        adb("wait-for-device", timeout=30)
+    except subprocess.TimeoutExpired:
+        sys.exit("error: device did not come back after `adb root`")
     who = adb("shell", "id").stdout.decode(errors="replace")
     if "uid=0" not in who:
         sys.exit("error: could not get adb root (needs a userdebug/ro.debuggable build)")
