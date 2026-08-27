@@ -16,17 +16,22 @@ Requires: adb root on a userdebug build, and ffplay for the viewer.
 """
 
 import argparse
+import itertools
 import os
 import shutil
+import struct
 import subprocess
 import sys
+import threading
 import time
+from queue import Queue
 
 DEVICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 MAX_CHUNK = 1 << 24     # anything larger is garbage, not a 240x320 frame
+RAW_HDR = 16            # w, h, format, planes -- uint32 LE each
 
 # Linux input event codes, per `getevent -pl` on the device.
 # matrix-keypad (event1) carries the whole keypad; the power/volume keys live
@@ -91,18 +96,25 @@ def wake():
 
 
 class FrameStream:
-    """Reads the PNG stream produced by kaimirror_device.sh.
+    """Reads the frame stream produced by kaimirror_device.sh.
 
-    The device sends back-to-back PNGs with no length prefix -- framing them
-    device-side would cost a `stat` fork per frame, and forks are the pump's
-    dominant cost.  So we walk the PNG chunk headers to find each IEND, which
-    is free here and self-synchronising: if the stream is ever damaged we scan
-    forward to the next signature rather than dying.
+    Frames arrive back to back with no length prefix -- framing them
+    device-side would cost a fork per frame, and forks are the pump's dominant
+    cost.  Both formats are self-describing enough to split here for free, and
+    both parsers resynchronise rather than dying if the stream is damaged:
+
+    raw  16-byte header (w, h, format, planes) then w*h*2 bytes of RGB565;
+         the header doubles as the sync marker and reports the geometry, so
+         the cover display's 128x160 needs no special casing.
+    png  walk the chunk headers to the IEND chunk.
     """
 
-    def __init__(self, delay_us=5000, display=0):
+    def __init__(self, delay_us=5000, display=0, fmt="raw", guard=True):
+        self.fmt = fmt
+        self.geom = None    # (w, h), learned from the first raw frame header
         self.proc = subprocess.Popen(
-            ["adb", "exec-out", "sh", REMOTE_SCRIPT, str(delay_us), str(display)],
+            ["adb", "exec-out", "sh", REMOTE_SCRIPT, str(delay_us), str(display),
+             fmt, "1" if guard else "0"],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.buf = b""
         self.pos = 8        # chunk-walk offset within the frame being parsed
@@ -153,12 +165,54 @@ class FrameStream:
                 return png
             self.pos = end
 
-    def frames(self):
+    def _raw_geom(self, at=0):
+        """Read a raw frame header, or None if it is not a plausible one."""
+        if at + RAW_HDR > len(self.buf):
+            return None
+        w, h, fmt, planes = struct.unpack_from("<4I", self.buf, at)
+        if 0 < w <= 1024 and 0 < h <= 1024 and fmt < 64 and 0 < planes <= 4:
+            return w, h
+        return None
+
+    def _next_raw(self):
         while True:
-            png = self._next_png()
-            if png is None:
+            geom = self._raw_geom()
+            if geom is None:
+                if len(self.buf) < RAW_HDR:
+                    if not self._fill():
+                        return None
+                    continue
+                # Desync (a torn frame under --no-device-guard): hunt forward
+                # for the next plausible header rather than giving up.
+                j = 1
+                while j <= len(self.buf) - RAW_HDR:
+                    if self._raw_geom(j):
+                        break
+                    j += 1
+                else:
+                    self.buf = self.buf[-(RAW_HDR - 1):]
+                    if not self._fill():
+                        return None
+                    continue
+                self.buf = self.buf[j:]
+                continue
+            w, h = geom
+            need = RAW_HDR + w * h * 2
+            if len(self.buf) < need:
+                if not self._fill():
+                    return None
+                continue
+            frame, self.buf = self.buf[:need], self.buf[need:]
+            self.geom = geom
+            return frame[RAW_HDR:]
+
+    def frames(self):
+        nxt = self._next_png if self.fmt == "png" else self._next_raw
+        while True:
+            frame = nxt()
+            if frame is None:
                 return
-            yield png
+            yield frame
 
     def close(self):
         try:
@@ -167,16 +221,52 @@ class FrameStream:
             pass
 
 
-def pipe_to(stream, sink_cmd, label, scale, fps_report):
-    sink = subprocess.Popen(sink_cmd, stdin=subprocess.PIPE)
+def sink_input(stream, fps):
+    """ffmpeg/ffplay input args for whatever the device is sending."""
+    if stream.fmt == "raw":
+        w, h = stream.geom
+        return ["-f", "rawvideo", "-pixel_format", "rgb565le",
+                "-video_size", f"{w}x{h}", "-framerate", str(fps), "-i", "-"]
+    return ["-f", "image2pipe", "-vcodec", "png", "-framerate", str(fps), "-i", "-"]
+
+
+def pipe_to(stream, make_cmd, label, fps_report):
+    # The first frame carries the geometry, so the sink cannot be built until
+    # it has arrived.
+    frames = stream.frames()
+    try:
+        first = next(frames)
+    except StopIteration:
+        stream.close()
+        sys.exit("error: no frames from device (is the panel awake?)")
+    sink = subprocess.Popen(make_cmd(stream), stdin=subprocess.PIPE)
+
+    # A raw frame (153KB) is larger than the 64KB pipe buffer, so writing it
+    # inline blocks until ffmpeg drains -- and while we are blocked we are not
+    # draining adb, which stalls the device pump.  Hand the writes to a thread
+    # so reading and feeding overlap.
+    queue = Queue(maxsize=16)
+
+    def writer():
+        while True:
+            frame = queue.get()
+            if frame is None:
+                return
+            try:
+                sink.stdin.write(frame)
+                sink.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                return
+
+    pump = threading.Thread(target=writer, daemon=True)
+    pump.start()
+
     n, t0, last = 0, time.time(), time.time()
     try:
-        for png in stream.frames():
-            try:
-                sink.stdin.write(png)
-                sink.stdin.flush()
-            except BrokenPipeError:
+        for png in itertools.chain([first], frames):
+            if not pump.is_alive():
                 break
+            queue.put(png)
             n += 1
             if fps_report and time.time() - last >= 5:
                 el = time.time() - t0
@@ -186,6 +276,13 @@ def pipe_to(stream, sink_cmd, label, scale, fps_report):
         pass
     finally:
         stream.close()
+        # Let the writer drain what is already queued before closing the sink,
+        # so a recording keeps its last frames.
+        try:
+            queue.put(None, timeout=5)
+            pump.join(timeout=10)
+        except Exception:
+            pass
         try:
             sink.stdin.close()
         except Exception:
@@ -199,29 +296,35 @@ def pipe_to(stream, sink_cmd, label, scale, fps_report):
 def cmd_view(a):
     if not shutil.which("ffplay"):
         sys.exit("error: ffplay not found (install ffmpeg)")
-    stream = FrameStream(a.poll_delay, a.display)
-    cmd = ["ffplay", "-hide_banner", "-loglevel", "error",
-           "-f", "image2pipe", "-vcodec", "png",
-           "-framerate", str(a.fps), "-i", "-",
-           "-window_title", "kaimirror", "-autoexit"]
-    if a.scale != 1:
-        cmd[-3:-3] = ["-vf", f"scale=iw*{a.scale}:ih*{a.scale}:flags=neighbor"]
-    pipe_to(stream, cmd, "view", a.scale, True)
+    stream = FrameStream(a.poll_delay, a.display, a.format, not a.no_device_guard)
+
+    def make(s):
+        cmd = ["ffplay", "-hide_banner", "-loglevel", "error"]
+        cmd += sink_input(s, a.fps)
+        if a.scale != 1:
+            cmd += ["-vf", f"scale=iw*{a.scale}:ih*{a.scale}:flags=neighbor"]
+        return cmd + ["-window_title", "kaimirror", "-autoexit"]
+
+    pipe_to(stream, make, "view", True)
 
 
 def cmd_record(a):
     if not shutil.which("ffmpeg"):
         sys.exit("error: ffmpeg not found")
-    stream = FrameStream(a.poll_delay, a.display)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "image2pipe", "-vcodec", "png", "-framerate", str(a.fps),
-           "-i", "-", "-pix_fmt", "yuv420p", a.output]
-    pipe_to(stream, cmd, "record", 1, True)
+    stream = FrameStream(a.poll_delay, a.display, a.format, not a.no_device_guard)
+
+    def make(s):
+        return (["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+                + sink_input(s, a.fps) + ["-pix_fmt", "yuv420p", a.output])
+
+    pipe_to(stream, make, "record", True)
     print(f"wrote {a.output}", file=sys.stderr)
 
 
 def cmd_shot(a):
-    stream = FrameStream(a.poll_delay, a.display)
+    # Always PNG: a single frame is not worth optimising, and PNG carries more
+    # colour precision than the RGB565 raw dump.
+    stream = FrameStream(a.poll_delay, a.display, "png", True)
     try:
         for png in stream.frames():
             with open(a.output, "wb") as fh:
@@ -250,16 +353,23 @@ def main():
                    help="0=primary (default), 1=external/cover")
     p.add_argument("--no-wake", action="store_true",
                    help="do not tap power before streaming")
+    p.add_argument("--format", choices=("raw", "png"), default="raw",
+                   help="stream format for view/record: raw RGB565 (default, "
+                        "content-independent rate) or png (12x less bandwidth)")
+    p.add_argument("--no-device-guard", action="store_true",
+                   help="skip the device-side completeness wait and resync on "
+                        "the frame header instead: faster, but a torn frame "
+                        "becomes possible")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     v = sub.add_parser("view", help="live mirror in an ffplay window")
     v.add_argument("--scale", type=float, default=2.0)
-    v.add_argument("--fps", type=int, default=6)
+    v.add_argument("--fps", type=int, default=7)
     v.set_defaults(func=cmd_view)
 
     r = sub.add_parser("record", help="record the screen to a video file")
     r.add_argument("output")
-    r.add_argument("--fps", type=int, default=6)
+    r.add_argument("--fps", type=int, default=7)
     r.set_defaults(func=cmd_record)
 
     s = sub.add_parser("shot", help="save a single screenshot")
