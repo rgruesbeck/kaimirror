@@ -30,7 +30,7 @@ IEND=49454e44ae426082
 SZ=""
 
 rm -f "$W" "$R"
-trap 'rm -f "$W" "$R"' EXIT
+trap 'rm -f "$W" "$R"' EXIT HUP INT TERM
 
 # PNG grows in chunks, so wait for the IEND chunk to land.
 wait_png() {
@@ -40,7 +40,7 @@ wait_png() {
 }
 
 # Raw frames are a fixed size, so completeness is just a size compare.  The
-# size depends on the display (240x320 and the 128x160 cover differ), so learn
+# size depends on the display (240x320 and the 128x128 cover differ), so learn
 # it from the first frame by waiting for the size to stop changing.
 wait_raw() {
   if [ -z "$SZ" ]; then
@@ -75,7 +75,11 @@ mv -f "$W" "$R" 2>/dev/null
 
 while true; do
   gfxdebugger -c screencap -d "$DISP" -p "$W" >/dev/null 2>&1  # b2g writes...
-  cat "$R" 2>/dev/null                                         # ...while we ship
+  # ...while we ship.  A failed write on a frame we know is there means the
+  # host hung up: exit, or this loop spins forever as an orphan.
+  if [ -s "$R" ]; then
+    cat "$R" 2>/dev/null || exit 0
+  fi
   guard
-  mv -f "$W" "$R" 2>/dev/null || continue
+  mv -f "$W" "$R" 2>/dev/null
 done
