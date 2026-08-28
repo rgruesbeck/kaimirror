@@ -78,11 +78,11 @@ shell pump and says so, at roughly a fifth of the speed.
 ./kaimirror.py shot --display 1 cover.png
 ./kaimirror.py view --control           # drive the phone from the terminal
 ./kaimirror.py view --format png        # PNG stream: 12x less bandwidth, slower
-./kaimirror.py view --max-fps 60        # raise the cap; costs b2g a lot of CPU
+./kaimirror.py record --fps 10 out.mp4  # lighter on the device, correctly timed
 ```
 
-The capture options (`--display`, `--poll-delay`, `--no-wake`, and for
-`view`/`record` also `--format`, `--max-fps`) work on either side of
+The capture options (`--display`, `--no-wake`, and for `view`/`record` also
+`--format`, `--fps`, `--control`) work on either side of
 the subcommand name, so the older `./kaimirror.py --display 1 shot cover.png`
 form still works too.
 
@@ -109,7 +109,27 @@ budget is — so the rate is capped by choice, not by capability.
 
 Uncapped is measured but not recommended: it re-captures a screen that is not
 changing that fast, and pays most of b2g's CPU and 22 MB/s of flash writes to
-do it. `--max-fps 0` uncaps if you want it.
+do it.
+
+`--fps` is one knob: it caps what the device captures **and** is what the sink
+is told. Those used to be separate (`--max-fps` and `--fps`), which meant any
+gap between them silently produced a wrong-speed video — 6s recorded at 10 fps
+but declared as 30 came out as a 1.7s file playing at 3.5x. There is no way to
+express that mismatch now.
+
+Uncapped is no longer reachable from the CLI, because a variable rate cannot
+be declared honestly to a container. The pump still does it directly, for
+benchmarking:
+
+```sh
+adb exec-out /data/local/tmp/kaipump 5000 0 raw 1 150 ipc 0   # 0 = uncapped
+```
+
+There is also no `--poll-delay` any more. It set how long the device-side
+guard slept between checks for a complete frame; swept from 200us to 5ms it
+made no measurable difference, because the pump spends its time waiting on b2g
+rather than on the poll, and going much lower only competes for CPU with the
+process producing the frames. It is a constant now.
 
 Other paths, all with the IPC pump:
 

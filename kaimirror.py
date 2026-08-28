@@ -42,7 +42,13 @@ REMOTE_PUMP = "/data/local/tmp/kaipump"
 DEVICE_SCRIPT = os.path.join(_HERE, "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
 REMOTE_STAGING = "/data/local/tmp/.kaimirror_* /data/local/tmp/kaipump.stats"
-MAX_FPS = 30            # uncapped costs most of b2g's CPU; see README
+DEFAULT_FPS = 30        # uncapped costs most of b2g's CPU; see README
+# How long the device-side guard sleeps between checks for a complete frame.
+# Not a CLI option: swept from 200us to 5ms it makes no measurable difference,
+# because the pump spends its time waiting on b2g rather than on the poll, and
+# going much below this only competes for CPU with the process producing the
+# frames.
+POLL_DELAY_US = 5000
 
 # Terminal keystrokes -> device keys, for `view --control`.  Arrow keys arrive
 # as escape sequences; the rest are what a phone keypad has anyway.
@@ -254,16 +260,16 @@ class FrameStream:
     png  walk the chunk headers to the IEND chunk.
     """
 
-    def __init__(self, delay_us, display, fmt, pump, max_fps=MAX_FPS):
+    def __init__(self, display, fmt, pump, fps=DEFAULT_FPS):
         self.fmt = fmt
         self.geom = None    # (w, h), learned from the first raw frame header
         if pump == "native":
             # limit=0 streams without end; the cap is what keeps b2g off the
             # CPU, since uncapped the pump outruns the panel several times over.
-            argv = [REMOTE_PUMP, str(delay_us), str(display), fmt,
-                    "1", "0", "ipc", str(max_fps)]
+            argv = [REMOTE_PUMP, str(POLL_DELAY_US), str(display), fmt,
+                    "1", "0", "ipc", str(fps)]
         else:
-            argv = ["sh", REMOTE_SCRIPT, str(delay_us), str(display), fmt, "1"]
+            argv = ["sh", REMOTE_SCRIPT, str(POLL_DELAY_US), str(display), fmt, "1"]
         self.proc = subprocess.Popen(
             ["adb", "exec-out"] + argv, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -458,7 +464,7 @@ def pipe_to(stream, make_cmd, label):
 def cmd_view(a):
     if not shutil.which("ffplay"):
         sys.exit("error: ffplay not found (install ffmpeg)")
-    stream = FrameStream(a.poll_delay, a.display, a.format, a.pump, a.max_fps)
+    stream = FrameStream(a.display, a.format, a.pump, a.fps)
 
     def make(s):
         cmd = ["ffplay", "-hide_banner", "-loglevel", "error"]
@@ -495,7 +501,7 @@ def cmd_view(a):
 def cmd_record(a):
     if not shutil.which("ffmpeg"):
         sys.exit("error: ffmpeg not found")
-    stream = FrameStream(a.poll_delay, a.display, a.format, a.pump, a.max_fps)
+    stream = FrameStream(a.display, a.format, a.pump, a.fps)
 
     def make(s):
         return (["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
@@ -508,7 +514,7 @@ def cmd_record(a):
 def cmd_shot(a):
     # Always PNG: a single frame is not worth optimising, and PNG carries more
     # colour precision than the RGB565 raw dump.
-    stream = FrameStream(a.poll_delay, a.display, "png", a.pump)
+    stream = FrameStream(a.display, "png", a.pump)
     try:
         for png in stream.frames():
             with open(a.output, "wb") as fh:
@@ -563,9 +569,6 @@ def capture_opts(stream, defaults=False):
         return v if defaults else argparse.SUPPRESS
 
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--poll-delay", type=positive_int, metavar="US",
-                   default=dflt(5000),
-                   help="device-side inter-poll usleep in us (default: 5000)")
     p.add_argument("--display", type=int, choices=(0, 1), default=dflt(0),
                    help="0=primary panel, 1=external/cover display "
                         "(default: 0); geometry is read from the frame")
@@ -577,11 +580,16 @@ def capture_opts(stream, defaults=False):
                        help="stream format: raw RGB565 (default, "
                             "content-independent rate) or png (12x less "
                             "bandwidth, slower)")
-        p.add_argument("--max-fps", type=positive_int, default=dflt(MAX_FPS),
-                       help=f"cap the device-side capture rate (default: "
-                            f"{MAX_FPS}).  Uncapping costs most of b2g's CPU "
-                            f"to re-capture a screen that is not changing "
-                            f"that fast; native pump only")
+        # One rate, not two.  It caps what the device captures *and* is what
+        # the sink is told, because any gap between those two silently
+        # produces a wrong-speed video -- 6s recorded at 10 fps but declared
+        # as 30 came out as a 1.7s file at 3.5x.
+        p.add_argument("--fps", type=positive_int, default=dflt(DEFAULT_FPS),
+                       help=f"frame rate: caps the device-side capture and is "
+                            f"what the sink is told (default: {DEFAULT_FPS}). "
+                            f"The native pump can exceed this but costs most "
+                            f"of b2g's CPU doing it; the shell fallback "
+                            f"manages ~6 whatever you ask for")
     return p
 
 
@@ -595,7 +603,7 @@ examples:
   kaimirror key DOWN OK              inject key presses (key --list for names)
   kaimirror view --format png        12x less bandwidth, painful over wifi
   kaimirror view --control           drive the phone from the terminal
-  kaimirror view --max-fps 60        uncap-ish; costs b2g a lot of CPU
+  kaimirror record --fps 10 out.mp4  lighter on the device, correctly timed
 """
 
 
@@ -621,10 +629,6 @@ def build_parser():
                         "for `kaimirror key`); needs a TTY")
     v.add_argument("--scale", type=positive_float, default=2.0,
                    help="window magnification, nearest-neighbour (default: 2)")
-    v.add_argument("--fps", type=positive_int, default=MAX_FPS,
-                   help=f"rate declared to ffplay; the native pump delivers "
-                        f"~{MAX_FPS}, the shell fallback ~6 "
-                        f"(default: {MAX_FPS})")
     v.set_defaults(func=cmd_view, capture=True)
 
     r = sub.add_parser("record", parents=[stream_opts], formatter_class=fmt,
@@ -634,10 +638,6 @@ def build_parser():
                                    "overwritten.")
     r.add_argument("output", help="output path; the extension picks the "
                                   "container (e.g. out.mp4)")
-    r.add_argument("--fps", type=positive_int, default=MAX_FPS,
-                   help=f"rate declared to ffmpeg; the native pump delivers "
-                        f"~{MAX_FPS}, the shell fallback ~6 "
-                        f"(default: {MAX_FPS})")
     r.set_defaults(func=cmd_record, capture=True)
 
     s = sub.add_parser("shot", parents=[still_opts], formatter_class=fmt,
