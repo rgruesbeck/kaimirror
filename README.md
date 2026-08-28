@@ -76,6 +76,7 @@ shell pump and says so, at roughly a fifth of the speed.
 ./kaimirror.py key DOWN OK              # inject key presses
 ./kaimirror.py wake                     # tap power so the panel is lit
 ./kaimirror.py shot --display 1 cover.png
+./kaimirror.py view --control           # drive the phone from the terminal
 ./kaimirror.py view --format png        # PNG stream: 12x less bandwidth, slower
 ./kaimirror.py view --max-fps 60        # raise the cap; costs b2g a lot of CPU
 ```
@@ -212,6 +213,30 @@ numbers above were checked rather than trusted: the pump counts captures
 against frames shipped (`/data/local/tmp/kaipump.stats`), every frame is
 verified to start on a header with no trailing remainder, and IPC output is
 byte-identical to `exec` output on a static screen.
+
+### Driving the device
+
+`--control` forwards terminal keystrokes to the phone while the mirror runs:
+arrows navigate, enter is OK, backspace is BACK, digits and `*`/`#` are
+themselves, `m` is MENU, `,`/`.` are the soft keys, `q` quits.
+
+Keys go over a **persistent channel**, which is the whole point: a one-shot
+`kaimirror key` costs ~140 ms, of which ~104 ms is just the `adb shell` round
+trip and the process spawns. Holding one `adb shell` open for the session
+turns that into a 0.2 ms pipe write, and the pump writes `struct input_event`
+straight to `/dev/input/eventN` instead of forking `sendevent` twice per key.
+
+It needs its own connection rather than riding the frame stream: the stream
+uses `adb exec-out`, because `adb shell` mangles binary output, and
+**`exec-out` does not forward stdin at all**.
+
+Note that keystrokes are read from the *terminal*, not the mirror window —
+ffplay keeps its own key handling and offers no way to forward them.
+
+End-to-end, a keypress reaches the screen in **~240 ms**, and that is now
+dominated by b2g's own repaint plus the capture pipeline rather than by the
+transport; varying the key hold between 5 ms and 50 ms does not move it
+outside the noise.
 
 ### Dead ends, all tested on the device
 

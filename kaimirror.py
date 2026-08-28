@@ -19,12 +19,15 @@ Requires: adb root on a userdebug build, and ffplay for the viewer.
 import argparse
 import itertools
 import os
+import select
 import shutil
 import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 from queue import Queue
 
 VERSION = "0.1.0"
@@ -40,6 +43,16 @@ DEVICE_SCRIPT = os.path.join(_HERE, "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
 REMOTE_STAGING = "/data/local/tmp/.kaimirror_* /data/local/tmp/kaipump.stats"
 MAX_FPS = 30            # uncapped costs most of b2g's CPU; see README
+
+# Terminal keystrokes -> device keys, for `view --control`.  Arrow keys arrive
+# as escape sequences; the rest are what a phone keypad has anyway.
+CONTROL_KEYS = {
+    "\x1b[A": "UP", "\x1b[B": "DOWN", "\x1b[C": "RIGHT", "\x1b[D": "LEFT",
+    "\r": "OK", "\n": "OK", "\x7f": "BACK", "\x08": "BACK",
+    "*": "STAR", "#": "POUND", ",": "SOFT_LEFT", ".": "SOFT_RIGHT",
+    "m": "MENU", "c": "CALL", "-": "VOLUMEDOWN", "+": "VOLUMEUP",
+    **{str(d): str(d) for d in range(10)},
+}
 # Reaping a pump means killing its whole process group: an orphan wedges in
 # `cat`, blocked writing to a half-open adb socket that never returns EPIPE, so
 # signalling the shell alone leaves it stuck with the write still pending.  The
@@ -121,6 +134,78 @@ def push_pump():
     # staging paths, so clear any before starting.
     adb("shell", PUMP_SWEEP)
     return kind
+
+
+class Controller:
+    """A persistent key-injection channel to the device.
+
+    Each `adb shell sendevent` costs ~140ms, nearly all of it the round trip
+    and the process spawns rather than the injection -- the same startup cost
+    that dominated frame capture.  One long-lived `adb shell` amortises it
+    away, leaving a pipe write.
+
+    This cannot ride the frame connection: the stream needs `adb exec-out`,
+    because `adb shell` mangles binary output, and `exec-out` does not forward
+    stdin at all.  So control gets its own connection.
+    """
+
+    def __init__(self, pump):
+        # The shell fallback has no control mode; fall back to one-shot keys.
+        self.proc = None
+        if pump != "native":
+            return
+        self.proc = subprocess.Popen(
+            ["adb", "shell", REMOTE_PUMP, "control"], stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def send(self, name):
+        if self.proc is None:
+            send_key(name)
+            return
+        node, code = KEYS[name]
+        try:
+            self.proc.stdin.write(f"{node} {code}\n".encode())
+            self.proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            pass    # the channel died; the mirror itself is still fine
+
+    def close(self):
+        if self.proc is None:
+            return
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        self.proc.kill()
+
+
+def control_loop(ctl, stop, on_quit):
+    """Forward terminal keystrokes to the device until stopped.
+
+    Runs the terminal in cbreak mode so keys arrive unbuffered, and restores
+    it whatever happens -- leaving a terminal in cbreak is worse than any
+    failure this can hit.
+    """
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        while not stop.is_set():
+            # Poll rather than block, so a stop set elsewhere is noticed
+            # without needing one more keystroke to wake this up.
+            if not select.select([fd], [], [], 0.2)[0]:
+                continue
+            ch = os.read(fd, 1).decode(errors="ignore")
+            if ch == "\x1b":               # escape sequence: arrow keys
+                ch += os.read(fd, 2).decode(errors="ignore")
+            if ch in ("q", "\x03"):
+                on_quit()
+                return
+            name = CONTROL_KEYS.get(ch)
+            if name:
+                ctl.send(name)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
 
 def send_key(name):
@@ -373,7 +458,26 @@ def cmd_view(a):
             cmd += ["-vf", f"scale=iw*{a.scale}:ih*{a.scale}:flags=neighbor"]
         return cmd + ["-window_title", "kaimirror", "-autoexit"]
 
-    pipe_to(stream, make, "view")
+    # ffplay keeps its own keystrokes, so control is driven from the terminal
+    # rather than from the mirror window.
+    ctl = keys = stop = None
+    if a.control and sys.stdin.isatty():
+        ctl, stop = Controller(a.pump), threading.Event()
+        keys = threading.Thread(target=control_loop,
+                                args=(ctl, stop, stream.close), daemon=True)
+        keys.start()
+        print("control: arrows/enter navigate, backspace=back, digits, "
+              "m=menu, q=quit", file=sys.stderr)
+    elif a.control:
+        print("note: --control needs a terminal; ignoring", file=sys.stderr)
+
+    try:
+        pipe_to(stream, make, "view")
+    finally:
+        if stop:
+            stop.set()
+            keys.join(timeout=1)
+            ctl.close()
 
 
 def cmd_record(a):
@@ -478,6 +582,7 @@ examples:
   kaimirror shot --display 1 cover.png
   kaimirror key DOWN OK              inject key presses (key --list for names)
   kaimirror view --format png        12x less bandwidth, painful over wifi
+  kaimirror view --control           drive the phone from the terminal
   kaimirror view --max-fps 60        uncap-ish; costs b2g a lot of CPU
 """
 
@@ -498,6 +603,10 @@ def build_parser():
     v = sub.add_parser("view", parents=[stream_opts], formatter_class=fmt,
                        help="live mirror in an ffplay window",
                        description="Live mirror in an ffplay window.")
+    v.add_argument("--control", action="store_true",
+                   help="forward terminal keystrokes to the device over a "
+                        "persistent channel (~0.3ms per key against ~140ms "
+                        "for `kaimirror key`); needs a TTY")
     v.add_argument("--scale", type=positive_float, default=2.0,
                    help="window magnification, nearest-neighbour (default: 2)")
     v.add_argument("--fps", type=positive_int, default=MAX_FPS,

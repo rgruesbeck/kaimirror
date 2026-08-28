@@ -3,6 +3,8 @@
 //! usage: kaipump [delay_us] [display] [raw|png] [guard 0|1] [limit]
 //!               [ipc|exec] [max_fps]
 //!        kaipump probe
+//!        kaipump key NODE CODE [hold_ms]
+//!        kaipump control
 //!
 //! This replaces kaimirror_device.sh, whose cost was dominated by process
 //! startup rather than by capture.  Every external command on this hardware
@@ -25,7 +27,7 @@
 //! formats are self-describing enough for the host to split them for free.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,62 @@ use std::time::{Duration, Instant};
 
 const IPC_SOCKET: &str = "/dev/socket/gfxdebugger-ipc";
 const STATS_PATH: &str = "/data/local/tmp/kaipump.stats";
+/// A key press costs ~140ms through `adb shell sendevent`, nearly all of it
+/// the round trip and the two process spawns -- the same startup cost that
+/// dominated frame capture.  Writing the events straight to the input node
+/// from a process that is already running removes both.
+const KEY_HOLD_MS: u64 = 50;
+const EV_SYN: u16 = 0;
+const EV_KEY: u16 = 1;
+
+/// One `struct input_event` as the 4.9 kernel expects it on 32-bit ARM:
+/// a 2x32-bit timeval, then type, code and value -- 16 bytes.  The timestamp
+/// is left zero because the kernel stamps injected events itself, which is
+/// what `sendevent` relies on too.
+fn input_event(kind: u16, code: u16, value: i32) -> [u8; 16] {
+    let mut e = [0u8; 16];
+    e[8..10].copy_from_slice(&kind.to_le_bytes());
+    e[10..12].copy_from_slice(&code.to_le_bytes());
+    e[12..16].copy_from_slice(&value.to_le_bytes());
+    e
+}
+
+/// Take key presses on stdin for as long as the host sends them, one
+/// "node code [hold_ms]" line each.
+///
+/// This runs as its own `adb shell` invocation rather than riding the frame
+/// connection, because `adb exec-out` -- which the frame stream needs, since
+/// `adb shell` mangles binary output -- does not forward stdin at all.  One
+/// long-lived shell still amortises away the ~104ms per-key round trip that
+/// made `adb shell sendevent` feel sluggish.
+fn control() {
+    for line in io::stdin().lock().lines() {
+        let Ok(line) = line else { return };
+        let mut f = line.split_whitespace();
+        let (Some(node), Some(code)) = (f.next(), f.next()) else { continue };
+        let (Ok(node), Ok(code)) = (node.parse(), code.parse()) else { continue };
+        let hold = f.next().and_then(|s| s.parse().ok()).unwrap_or(KEY_HOLD_MS);
+        // A key that fails to inject must not take the channel down with it.
+        let _ = send_key(node, code, Duration::from_millis(hold));
+    }
+}
+
+/// Press and release one key, with the same hold the host used to get from
+/// `sendevent; sleep; sendevent`.
+fn send_key(node: u32, code: u16, hold: Duration) -> io::Result<()> {
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .open(format!("/dev/input/event{node}"))?;
+    for value in [1, 0] {
+        f.write_all(&input_event(EV_KEY, code, value))?;
+        f.write_all(&input_event(EV_SYN, 0, 0))?;
+        if value == 1 {
+            thread::sleep(hold);
+        }
+    }
+    Ok(())
+}
+
 const PNG_IEND: [u8; 8] = [0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82];
 
 /// The screencap request, as observed on the wire from `gfxdebugger` itself:
@@ -298,6 +356,21 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("probe") {
         probe();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("control") {
+        control();
+        return;
+    }
+    if args.first().map(String::as_str) == Some("key") {
+        let node: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+        let code: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let hold = Duration::from_millis(
+            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(KEY_HOLD_MS));
+        if let Err(e) = send_key(node, code, hold) {
+            let _ = fs::write(STATS_PATH, format!("key error={e}\n"));
+            std::process::exit(1);
+        }
         return;
     }
 
