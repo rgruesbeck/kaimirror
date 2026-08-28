@@ -5,7 +5,8 @@
 #
 #   ./build.sh            device pump + host CLI
 #   ./build.sh --push     ...and install the pump on the device
-#   ./build.sh --dist     ...and link the host half against musl, for release
+#   ./build.sh --dist     ...and link the host half against musl, then
+#                         package dist/ for a release
 #
 # The NDK only supplies the linker for the device half: that binary is static,
 # so nothing from the NDK ends up as a runtime dependency and the API level in
@@ -50,6 +51,18 @@ fi
 
 echo "device: $PUMP ($(du -h "$PUMP" | cut -f1))"
 echo "host:   $HOST ($(du -h "$HOST" | cut -f1), pump embedded)"
+
+# A release is one tarball: the host binary already carries the pump inside it.
+if [ -n "$DIST" ]; then
+  VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' kaimirror/Cargo.toml | head -1)
+  TARBALL=kaimirror-$VERSION-x86_64-linux.tar.gz
+  rm -rf dist && mkdir dist
+  cp "$HOST" dist/kaimirror
+  tar czf "dist/$TARBALL" -C dist kaimirror
+  rm dist/kaimirror
+  (cd dist && sha256sum "$TARBALL" > SHA256SUMS)
+  echo "dist:   dist/$TARBALL ($(du -h "dist/$TARBALL" | cut -f1)) + SHA256SUMS"
+fi
 
 [ -n "$PUSH" ] || exit 0
 adb push "$PUMP" /data/local/tmp/kaipump >/dev/null

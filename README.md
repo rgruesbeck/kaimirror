@@ -20,16 +20,44 @@ game's load screen dropped.*
 
 ## Install
 
-To run it you need `adb` with root on the device (KaiOS ships `userdebug`
-with `ro.debuggable=1`, so `adb root` works) and `ffmpeg`/`ffplay` on the
-host — the viewer is an ffplay window.
+You need `adb` with root on the device (KaiOS ships `userdebug` with
+`ro.debuggable=1`, so `adb root` works) and `ffmpeg`/`ffplay` on the host —
+the viewer is an ffplay window.
+
+### Download a binary
+
+The release is one file. It is statically linked against musl, so it runs on
+any x86-64 Linux without matching a glibc, and it **embeds the device pump**,
+so it installs its own other half on first use — no NDK, no Rust, no second
+download.
+
+```sh
+curl -LO https://github.com/rgruesbeck/kaimirror/releases/latest/download/kaimirror-0.2.0-x86_64-linux.tar.gz
+tar xzf kaimirror-0.2.0-x86_64-linux.tar.gz
+./kaimirror --version
+```
+
+Put it on your `PATH` if you want it everywhere:
+
+```sh
+install -Dm755 kaimirror ~/.local/bin/kaimirror
+```
+
+The release also carries a `SHA256SUMS`; to check the download against it:
+
+```sh
+curl -LO https://github.com/rgruesbeck/kaimirror/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS
+```
+
+### Build from source
 
 Both halves are Rust, built together:
 
 ```sh
 ./build.sh                # device pump + host CLI
 ./build.sh --push         # ...and install the pump on the device
-./build.sh --dist         # ...and link the host half statically, for release
+./build.sh --dist         # ...and link the host half statically, packaging dist/
 ```
 
 That needs the `armv7-linux-androideabi` target and an NDK at
@@ -42,8 +70,7 @@ rustup target add armv7-linux-androideabi x86_64-unknown-linux-musl
 
 The binary lands at `target/release/kaimirror` (or under
 `target/x86_64-unknown-linux-musl/release/` with `--dist`, which is what a
-release ships). It **embeds the device pump**, so it is one self-contained
-file that installs its own other half — copy it anywhere and it still works.
+release ships, alongside the tarball and checksum it writes to `dist/`).
 Building without the NDK works for editing the host half; the pump is then
 absent and the binary says so rather than pushing a stub.
 
@@ -114,5 +141,5 @@ power first unless you pass `--no-wake`.
 - `kaipump/` — device-side frame pump, statically linked for ARM32; the host
   binary embeds a copy and installs it when needed
 - `build.sh` — builds both halves; `--push` also installs the pump,
-  `--dist` builds the static host binary for a release
+  `--dist` builds the static host binary and packages `dist/` for a release
 - `docs/INTERNALS.md` — how capture works, the protocol, and the numbers
