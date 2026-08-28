@@ -1,7 +1,9 @@
 # kaimirror — scrcpy-style screen mirroring for KaiOS 3.x
 
 Live mirroring, recording, screenshots and key injection for a KaiOS device
-over adb. Tested on a **TCL Flip 3 (`T435SP` / `Gflip7_VZW`), KaiOS 3.x**.
+over adb. Tested on two TCL flip phones running KaiOS 3.x: the **Flip 3**
+(`T435SP` / `Gflip7_VZW`) and the **4056S** (`Gflip5_VZW`), which is the one
+in the demo below.
 
 scrcpy itself cannot work here: KaiOS runs Gecko (`b2g`) directly on the
 Android HAL, with no Android framework and no SurfaceFlinger for scrcpy's
@@ -9,6 +11,12 @@ server to bind an encoder to. kaimirror captures through b2g's own
 `gfxdebugger` socket instead, and injects keys on the raw `/dev/input`
 nodes — see [docs/INTERNALS.md](docs/INTERNALS.md) for how that was found
 and what it costs.
+
+![kaimirror mirroring a TCL flip phone's launcher](docs/demo.gif)
+
+*`kaimirror record --fps 10`, captured over adb at the phone's native
+240x320 and driven by hand. Two cuts from one 29-second take, with the
+game's load screen dropped.*
 
 ## Install
 

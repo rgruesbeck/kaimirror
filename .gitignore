@@ -31,6 +31,8 @@ htmlcov/
 *.mkv
 *.gif
 kaishot*.png
+# ...except the one the README shows
+!docs/demo.gif
 
 # Cargo build output (workspace root; both binaries land here)
 /target/
