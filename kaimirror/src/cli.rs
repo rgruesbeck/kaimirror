@@ -9,7 +9,10 @@
 
 use crate::keys;
 
-pub const VERSION: &str = "0.1.0";
+/// Read from Cargo.toml rather than repeated here: a hardcoded copy drifts
+/// the moment the package version moves, and quietly ships a binary that
+/// misreports itself.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const DEFAULT_FPS: u32 = 30;
 
 pub struct Args {
