@@ -50,46 +50,52 @@ directly instead — see [the protocol](#the-gfxdebugger-ipc-protocol).
 
 - `adb root` — the build is `userdebug` with `ro.debuggable=1`, so this works.
 - `ffmpeg` / `ffplay` on the host (the viewer is an ffplay window).
-- Python 3, stdlib only.
+- Rust and the Android NDK, to build (see below).
 
-For the fast path, the device-side pump also needs building once:
+Both halves are Rust, built together:
 
 ```sh
-kaipump/build.sh          # needs Rust + the Android NDK; see below
+./build.sh                # host CLI + device pump
+./build.sh --push         # ...and install the pump on the device
 ```
 
-That wants a Rust toolchain with the `armv7-linux-androideabi` target and an
-NDK at `$ANDROID_NDK_HOME` (default `~/Android/android-ndk-r27c`); the NDK
-supplies only the linker, since the binary is statically linked and carries
-its own libc. **This is optional** — without it `kaimirror` falls back to the
-shell pump and says so, at roughly a fifth of the speed.
+That wants the `armv7-linux-androideabi` target (`rustup target add
+armv7-linux-androideabi`) and an NDK at `$ANDROID_NDK_HOME` (default
+`~/Android/android-ndk-r27c`). The NDK supplies only the linker for the device
+half: that binary is statically linked and carries its own libc, so nothing
+from the NDK is a runtime dependency and the API level in the toolchain name
+is not a floor on the device.
+
+The host binary lands at `target/release/kaimirror`, the device pump at
+`target/armv7-linux-androideabi/release/kaipump`. `kaimirror` installs the
+pump itself when it needs to.
 
 ## Usage
 
-`./kaimirror.py --help` lists everything; each subcommand has its own `-h`.
+`kaimirror --help` lists everything; each command has its own `--help`.
 
 ```sh
-./kaimirror.py view                     # live mirror window (2x, nearest-neighbour)
-./kaimirror.py view --scale 3
-./kaimirror.py record out.mp4           # Ctrl-C to finalize
-./kaimirror.py shot screen.png
-./kaimirror.py key DOWN OK              # inject key presses
-./kaimirror.py wake                     # tap power so the panel is lit
-./kaimirror.py shot --display 1 cover.png
-./kaimirror.py view --control           # drive the phone from the terminal
-./kaimirror.py view --format png        # PNG stream: 12x less bandwidth, slower
-./kaimirror.py record --fps 10 out.mp4  # lighter on the device, correctly timed
+kaimirror view                     # live mirror window (2x, nearest-neighbour)
+kaimirror view --scale 3
+kaimirror record out.mp4           # Ctrl-C to finalize
+kaimirror shot screen.png
+kaimirror key DOWN OK              # inject key presses
+kaimirror wake                     # tap power so the panel is lit
+kaimirror shot --display 1 cover.png
+kaimirror view --control           # drive the phone from the terminal
+kaimirror view --format png        # PNG stream: 12x less bandwidth, slower
+kaimirror record --fps 10 out.mp4  # lighter on the device, correctly timed
 ```
 
 The capture options (`--display`, `--no-wake`, and for `view`/`record` also
 `--format`, `--fps`, `--control`) work on either side of
-the subcommand name, so the older `./kaimirror.py --display 1 shot cover.png`
+the command name, so `kaimirror --display 1 shot cover.png`
 form still works too.
 
 `view` and `record` stream uncompressed RGB565 by default; `shot` always uses
 PNG. See [Performance](#performance).
 
-Key names — `./kaimirror.py key --list` prints them: digits `0`–`9`, `UP`
+Key names — `kaimirror key --list` prints them: digits `0`–`9`, `UP`
 `DOWN` `LEFT` `RIGHT`, `OK`/`CENTER`, `BACK`, `MENU`, `HELP`, `CALL`/`SEND`,
 `STAR`, `POUND`, `SOFT_LEFT`, `SOFT_RIGHT`, `POWER`, `VOLUMEUP`,
 `VOLUMEDOWN`, `CAMERA`.
@@ -105,7 +111,7 @@ budget is — so the rate is capped by choice, not by capability.
 | `kaipump`, IPC, capped at 30 (default) | **28.7** | b2g at 16% CPU |
 | `kaipump`, IPC, uncapped | 66 | b2g at 74% CPU, 22 MB/s to flash |
 | `kaipump`, `exec` backend | ~20 | spawns `gfxdebugger` per frame |
-| `kaimirror_device.sh` (fallback) | 6.1 | four forks per frame |
+| the original shell pump (removed) | 6.1 | four forks per frame |
 
 Uncapped is measured but not recommended: it re-captures a screen that is not
 changing that fast, and pays most of b2g's CPU and 22 MB/s of flash writes to
@@ -150,7 +156,7 @@ Every external command on this device costs ~34 ms:
 | `gfxdebugger`, usage only (no capture) | 34.5 |
 | `gfxdebugger -c screencap` | 75.0 |
 
-The shell pump spent three or four of those per frame — ~136 ms of overhead —
+The shell pump this replaced spent three or four of those per frame — ~136 ms of overhead —
 and `gfxdebugger` itself is a process like any other. Replacing the loop with
 one long-lived binary that speaks b2g's socket directly removes every one of
 them.
@@ -269,10 +275,12 @@ outside the noise.
 
 ## Files
 
-- `kaimirror.py` — host-side CLI and frame-stream reader
+- `kaimirror/` — host-side CLI, frame-stream reader and control channel
 - `kaipump/` — device-side frame pump in Rust, statically linked for ARM32.
   Speaks b2g's socket directly; `build.sh [--push]` builds and installs it.
   Keeps an `exec` backend that spawns `gfxdebugger` per frame, so the claim
   that the socket is what makes it fast stays falsifiable.
-- `kaimirror_device.sh` — the original shell pump, kept as the fallback when
-  `kaipump` has not been built
+- `build.sh` — builds both halves; `--push` also installs the pump
+
+The shell pump that started this is gone: at 6 fps against 29 it was not worth
+carrying a second implementation of the frame protocol to keep it working.

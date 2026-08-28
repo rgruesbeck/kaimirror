@@ -1,0 +1,12 @@
+# Two binaries for two machines: kaimirror runs on the host, kaipump is
+# cross-compiled for the phone.  A workspace so one `cargo build` and one
+# lockfile cover both.
+[workspace]
+resolver = "2"
+members = ["kaimirror", "kaipump"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

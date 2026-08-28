@@ -1,0 +1,9 @@
+[package]
+name = "kaimirror"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Only for termios and signal handling: putting the terminal in cbreak mode
+# and finalizing a recording on Ctrl-C are both things std does not expose.
+libc = "0.2"

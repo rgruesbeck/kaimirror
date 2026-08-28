@@ -7,10 +7,3 @@ edition = "2021"
 # statically linked binary pushed to /data/local/tmp.  Keep dependencies at
 # zero so the build stays a single cross-compile with no vendoring step.
 [dependencies]
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
