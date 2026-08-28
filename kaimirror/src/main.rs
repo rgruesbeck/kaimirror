@@ -46,7 +46,7 @@ fn main() {
     // but install lazily so a keypress does not pay for a staleness check it
     // almost never needs.
     if matches!(cmd.as_str(), "view" | "record" | "shot") {
-        adb::push_pump(adb::local_pump());
+        adb::push_pump();
         if !a.no_wake {
             adb::wake();
         }

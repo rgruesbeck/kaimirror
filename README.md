@@ -55,20 +55,29 @@ directly instead — see [the protocol](#the-gfxdebugger-ipc-protocol).
 Both halves are Rust, built together:
 
 ```sh
-./build.sh                # host CLI + device pump
+./build.sh                # device pump + host CLI
 ./build.sh --push         # ...and install the pump on the device
+./build.sh --dist         # ...and link the host half statically, for release
 ```
 
 That wants the `armv7-linux-androideabi` target (`rustup target add
 armv7-linux-androideabi`) and an NDK at `$ANDROID_NDK_HOME` (default
-`~/Android/android-ndk-r27c`). The NDK supplies only the linker for the device
+`~/Android/android-ndk-r27c`); `--dist` additionally wants
+`x86_64-unknown-linux-musl`. The NDK supplies only the linker for the device
 half: that binary is statically linked and carries its own libc, so nothing
 from the NDK is a runtime dependency and the API level in the toolchain name
 is not a floor on the device.
 
-The host binary lands at `target/release/kaimirror`, the device pump at
-`target/armv7-linux-androideabi/release/kaipump`. `kaimirror` installs the
-pump itself when it needs to.
+The pump is built first and **embedded into the host binary**, so `kaimirror`
+is one self-contained file that carries the pump it installs — copy it
+anywhere and it still works. It lands at `target/release/kaimirror`, or at
+`target/x86_64-unknown-linux-musl/release/kaimirror` with `--dist`, which is
+what a release ships: a glibc binary carries the glibc of whatever box built
+it as a floor, which makes it useless as a download.
+
+Building without the NDK still works for editing the host half — the pump
+is then simply absent, and the resulting binary says so rather than pushing
+a stub.
 
 ## Usage
 
@@ -88,9 +97,9 @@ kaimirror record --fps 10 out.mp4  # lighter on the device, correctly timed
 ```
 
 The capture options (`--display`, `--no-wake`, and for `view`/`record` also
-`--format`, `--fps`, `--control`) work on either side of
-the command name, so `kaimirror --display 1 shot cover.png`
-form still works too.
+`--format` and `--fps`; `--control` and `--scale` are `view` only) work on
+either side of the command name, so the `kaimirror --display 1 shot cover.png`
+form works too.
 
 `view` and `record` stream uncompressed RGB565 by default; `shot` always uses
 PNG. See [Performance](#performance).
@@ -244,12 +253,13 @@ byte-identical to `exec` output on a static screen.
 
 `--control` forwards terminal keystrokes to the phone while the mirror runs:
 arrows navigate, enter is OK, backspace is BACK, digits and `*`/`#` are
-themselves, `m` is MENU, `,`/`.` are the soft keys, `q` quits.
+themselves, `m` is MENU, `c` is CALL, `,`/`.` are the soft keys, `-`/`+` are
+the volume keys, and `q` (or Ctrl-C) quits.
 
 Keys go over a **persistent channel**, which is the whole point: a one-shot
 `kaimirror key` costs ~140 ms, of which ~104 ms is just the `adb shell` round
 trip and the process spawns. Holding one `adb shell` open for the session
-turns that into a 0.2 ms pipe write, and the pump writes `struct input_event`
+turns that into a ~0.3 ms pipe write, and the pump writes `struct input_event`
 straight to `/dev/input/eventN` instead of forking `sendevent` twice per key.
 
 It needs its own connection rather than riding the frame stream: the stream
@@ -277,10 +287,12 @@ outside the noise.
 
 - `kaimirror/` — host-side CLI, frame-stream reader and control channel
 - `kaipump/` — device-side frame pump in Rust, statically linked for ARM32.
-  Speaks b2g's socket directly; `build.sh [--push]` builds and installs it.
+  Speaks b2g's socket directly; `build.sh [--push]` builds and installs it,
+  and `kaimirror` embeds a copy to install on its own.
   Keeps an `exec` backend that spawns `gfxdebugger` per frame, so the claim
   that the socket is what makes it fast stays falsifiable.
-- `build.sh` — builds both halves; `--push` also installs the pump
+- `build.sh` — builds both halves; `--push` also installs the pump,
+  `--dist` builds the static host binary for a release
 
 The shell pump that started this is gone: at 6 fps against 29 it was not worth
 carrying a second implementation of the frame protocol to keep it working.

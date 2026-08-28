@@ -73,20 +73,32 @@ pub fn ensure_root() {
     }
 }
 
+/// The device pump, built into this binary so a released kaimirror is one
+/// file.  Empty only when built without one -- see build.rs.
+static PUMP: &[u8] = include_bytes!(env!("KAIPUMP_BIN"));
+
 /// Install the device-side pump, skipping the push when the device already
 /// has this build.
 ///
 /// Every command needs the pump, `key` included, and pushing 350KB each time
 /// tripled what a keypress cost.  Comparing sizes is one cheap round trip and
 /// a rebuild effectively always changes the size.
-pub fn push_pump(local: &str) {
-    let Ok(meta) = std::fs::metadata(local) else {
-        fail(&format!("device pump not built: {local} is missing (run ./build.sh)"));
-    };
+pub fn push_pump() {
+    if PUMP.is_empty() {
+        fail("this kaimirror was built without a device pump (run ./build.sh)");
+    }
     let remote = stdout_of(&adb(&["shell", &format!("stat -c %s {REMOTE_PUMP} 2>/dev/null")]));
-    if remote.trim() != meta.len().to_string() {
-        adb(&["push", local, REMOTE_PUMP]);
+    if remote.trim() != PUMP.len().to_string() {
+        // adb push wants a path, so the embedded bytes only touch disk on the
+        // rare push -- not on the staleness check that answers "current"
+        // almost every time.
+        let staged = std::env::temp_dir().join(format!("kaipump.{}", std::process::id()));
+        if let Err(e) = std::fs::write(&staged, PUMP) {
+            fail(&format!("could not stage the device pump at {}: {e}", staged.display()));
+        }
+        adb(&["push", &staged.to_string_lossy(), REMOTE_PUMP]);
         adb(&["shell", "chmod", "755", REMOTE_PUMP]);
+        let _ = std::fs::remove_file(&staged);
     }
     // A pump orphaned by a host crash would fight this session over the same
     // staging paths, so clear any before starting.
@@ -109,17 +121,9 @@ pub fn send_key(name: &str) {
     // for a push when that turns out to be wrong.  Checking first would cost
     // a round trip on every keypress to answer "yes" almost every time.
     if !out.status.success() || String::from_utf8_lossy(&out.stderr).contains("not found") {
-        push_pump(local_pump());
+        push_pump();
         adb(&["shell", REMOTE_PUMP, "key", &node, &code]);
     }
-}
-
-/// Where build.sh leaves the cross-compiled device pump.
-pub fn local_pump() -> &'static str {
-    concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../target/armv7-linux-androideabi/release/kaipump"
-    )
 }
 
 /// Tap power so the panel is lit -- a blanked screen still composites, and

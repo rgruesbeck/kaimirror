@@ -4,14 +4,14 @@ version = 4
 
 [[package]]
 name = "kaimirror"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "kaipump"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "libc"
