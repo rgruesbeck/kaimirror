@@ -37,16 +37,32 @@ gfxdebugger -c screencap [-d 0|1] -p /data/local/tmp/frame.png
 gfxdebugger -c screencap [-d 0|1] -p /data/local/tmp/frame.raw
 ```
 
-`-d 0` = primary 240x320 panel, `-d 1` = 128x160 cover display (`st7735s`).
+`-d 0` = primary 240x320 panel, `-d 1` = 128x128 cover display (`st7735s`).
 Input injection goes through `sendevent` on the raw `/dev/input` nodes.
 Together these are the capture + control primitives scrcpy would otherwise get
 from the framework.
+
+`gfxdebugger` is only a thin client for that socket, though, and starting it
+costs more than the capture does. The device-side pump speaks the socket
+directly instead — see [the protocol](#the-gfxdebugger-ipc-protocol).
 
 ## Requirements
 
 - `adb root` — the build is `userdebug` with `ro.debuggable=1`, so this works.
 - `ffmpeg` / `ffplay` on the host (the viewer is an ffplay window).
 - Python 3, stdlib only.
+
+For the fast path, the device-side pump also needs building once:
+
+```sh
+kaipump/build.sh          # needs Rust + the Android NDK; see below
+```
+
+That wants a Rust toolchain with the `armv7-linux-androideabi` target and an
+NDK at `$ANDROID_NDK_HOME` (default `~/Android/android-ndk-r27c`); the NDK
+supplies only the linker, since the binary is statically linked and carries
+its own libc. **This is optional** — without it `kaimirror` falls back to the
+shell pump and says so, at roughly a fifth of the speed.
 
 ## Usage
 
@@ -61,34 +77,91 @@ from the framework.
 ./kaimirror.py wake                     # tap power so the panel is lit
 ./kaimirror.py shot --display 1 cover.png
 ./kaimirror.py view --format png        # PNG stream: 12x less bandwidth, slower
-./kaimirror.py view --no-device-guard   # ~8.8 fps, torn frames become possible
+./kaimirror.py view --max-fps 60        # raise the cap; costs b2g a lot of CPU
 ```
 
 The capture options (`--display`, `--poll-delay`, `--no-wake`, and for
-`view`/`record` also `--format`, `--no-device-guard`) work on either side of
+`view`/`record` also `--format`, `--max-fps`) work on either side of
 the subcommand name, so the older `./kaimirror.py --display 1 shot cover.png`
 form still works too.
 
 `view` and `record` stream uncompressed RGB565 by default; `shot` always uses
-PNG. See [Performance](#performance--read-this-before-expecting-scrcpy).
+PNG. See [Performance](#performance).
 
 Key names — `./kaimirror.py key --list` prints them: digits `0`–`9`, `UP`
 `DOWN` `LEFT` `RIGHT`, `OK`/`CENTER`, `BACK`, `MENU`, `HELP`, `CALL`/`SEND`,
 `STAR`, `POUND`, `SOFT_LEFT`, `SOFT_RIGHT`, `POWER`, `VOLUMEUP`,
 `VOLUMEDOWN`, `CAMERA`.
 
-## Performance — read this before expecting scrcpy
+## Performance
 
-**~6.5 fps streaming, ~8.8 with `--no-device-guard`.** This is a fast
-slideshow, not smooth video. It is fine for watching a UI flow, debugging a
-layout or recording a repro; it is not fine for anything motion-heavy.
+**~29 fps streaming.** That is a usable live mirror rather than the slideshow
+this started as. The device-side pump is no longer the bottleneck — b2g's CPU
+budget is — so the rate is capped by choice, not by capability.
+
+| Pump | fps | notes |
+|---|---|---|
+| `kaipump`, IPC, capped at 30 (default) | **28.7** | b2g at 16% CPU |
+| `kaipump`, IPC, uncapped | 66 | b2g at 74% CPU, 22 MB/s to flash |
+| `kaipump`, `exec` backend | ~20 | spawns `gfxdebugger` per frame |
+| `kaimirror_device.sh` (fallback) | 6.1 | four forks per frame |
+
+Uncapped is measured but not recommended: it re-captures a screen that is not
+changing that fast, and pays most of b2g's CPU and 22 MB/s of flash writes to
+do it. `--max-fps 0` uncaps if you want it.
+
+Other paths, all with the IPC pump:
 
 | Path | fps | notes |
 |---|---|---|
-| `view` / `record`, raw (default) | **6.5–6.6** | flat, whatever is on screen |
-| `record --no-device-guard` | **8.8** | torn frames become possible |
-| `record --format png` | 6.4 | decays as the screen gets busier |
-| `record --display 1` (128x160 cover) | 7.1 | geometry read from the frame header |
+| `--display 1` (128x128 cover), uncapped | 123 | geometry read from the frame header |
+| `--format png` | 12.4 | encode-bound: the cap makes no difference |
+
+### Where the time actually goes
+
+The bottleneck was **process startup**, not capture, not encoding, not flash.
+Every external command on this device costs ~34 ms:
+
+| | ms/call |
+|---|---|
+| shell builtin (`true`) | 1.4 |
+| `stat` / `od` / `tail` (toybox) | 33.7 / 35.8 / 33.9 |
+| `gfxdebugger`, usage only (no capture) | 34.5 |
+| `gfxdebugger -c screencap` | 75.0 |
+
+The shell pump spent three or four of those per frame — ~136 ms of overhead —
+and `gfxdebugger` itself is a process like any other. Replacing the loop with
+one long-lived binary that speaks b2g's socket directly removes every one of
+them.
+
+**An earlier version of this section claimed the remaining 41 ms of that 75 ms
+was b2g's capture, and predicted a ~24 fps ceiling. That was wrong.** The IPC
+pump sustains 150 captures/second with no process involved, so b2g composites
+in single-digit milliseconds; essentially all of the 75 ms was `gfxdebugger`
+starting up and dynamically linking `libbinder`, `libutils` and `libc++`. The
+ceiling was never the capture.
+
+### The gfxdebugger IPC protocol
+
+`gfxdebugger` is a thin client for `/dev/socket/gfxdebugger-ipc`. The whole
+exchange is one `connect()` and one `write()` — it never reads a reply, it
+just closes:
+
+```
+u32   0x04          constant
+u32   0x01          constant
+u32   0x02          command: screencap
+u32   display       0 = primary, 1 = cover
+cstr  path          NUL-terminated, zero-padded to a 4-byte boundary
+```
+
+Recovered by tracing the real binary (`strace` ships on the device), not by
+disassembling it, and each field pinned by varying the inputs: `-d 1` flips
+word 4 alone, and a 28-character path yields a 48-byte message against 40 for
+a 21-character one, matching the padding rule exactly.
+
+The "reply is a 4-byte parcel" claim in earlier notes is not something the
+client ever waits on — file completeness is the only real signal.
 
 ### The two output formats
 
@@ -105,78 +178,42 @@ header: f0 00 00 00  40 01 00 00  04 00 00 00  01 00 00 00
            w=240        h=320       format=4     planes=1
 ```
 
-Streaming defaults to raw because it skips the PNG encode entirely:
+Streaming defaults to raw because it skips the PNG encode entirely, which is
+now the dominant cost on that path — PNG sits at 12.4 fps whether capped or
+not, while raw runs to 66. The header also doubles as a sync marker and
+reports geometry, so the host splits frames for free and the cover display
+needs no special casing.
 
-- **The frame cost stops depending on the screen.** Raw sits at ~6.8 fps on
-  anything; PNG measured 6.40 fps on a 12 KB screen and 6.06 on a 23 KB one,
-  and keeps sliding as screens get busier.
-- **The completeness guard gets cheap.** Frame size is constant, so the guard
-  is one `stat` rather than a three-fork `tail | od | tr` pipeline.
-- **The header is a sync marker and reports geometry**, so the host splits
-  frames for free and the 128x160 cover display needs no special casing.
-
-The costs: **~12x the bandwidth** (~1.3 MB/s, fine over USB where adb does
-9 MB/s, painful over adb-on-wifi — use `--format png` there), and RGB565
+The costs: **~12x the bandwidth** (~4.4 MB/s at 29 fps, fine over USB where
+adb does 9, painful over adb-on-wifi — use `--format png` there), and RGB565
 colour. Raw is *not* pixel-identical to the PNG: only 0.2% of pixels match
 exactly, mean error ~0.5–6 per channel, PSNR 35.5 dB. Indistinguishable on
 flat UI, but `shot` always asks for PNG, where fidelity matters and throughput
 does not.
 
-### Where the time actually goes
-
-The bottleneck is **process startup**, not capture, not encoding, not flash.
-Every external command on this device costs ~34 ms:
-
-| | ms/call |
-|---|---|
-| shell builtin (`true`) | 1.4 |
-| `stat` / `od` / `tail` (toybox) | 33.7 / 35.8 / 33.9 |
-| `gfxdebugger`, usage only (no capture) | 34.5 |
-| `gfxdebugger -c screencap` | 75.0 |
-
-So the capture itself is only ~41 ms of that 75 ms — the rest is fork, exec
-and dynamic linking. **The real capture ceiling is ~24 fps, not 12.** This is
-also why switching format buys less than the 12x data reduction suggests:
-three or four forks per frame still cost ~136 ms whatever the format.
-
-An earlier serial design ran six external commands per frame and spent ~205 ms
-of every 314 ms frame in process startup alone (3.2 fps). The pump now
-pipelines instead: the capture for frame N+1 is issued *before* frame N is
-shipped, so b2g's write overlaps the transfer.
-
-Two more things that cost real time to discover:
-
-- **A raw frame is bigger than the pipe buffer.** Writing 153 KB to ffmpeg
-  inline blocks until it drains, and while blocked the host is not draining
-  adb, which stalls the device pump — that alone cost 6.6 fps -> 4.7. The host
-  feeds the sink from a writer thread.
-- The screen must be awake. A blanked panel captures as a valid 303-byte solid
-  black PNG, which looks like success. `view`/`record`/`shot` tap power first
-  unless you pass `--no-wake`. Note power *toggles* — if the panel was already
-  lit, `wake` turns it off.
-
 ### The race this design defends against
 
-`gfxdebugger` returns as soon as b2g **accepts** the request; b2g writes the
-file asynchronously. The reply is a 4-byte parcel: `0` = accepted, `1` =
-rejected. `0` does *not* mean the file was written — capturing to an
-unwritable path also returns `0`. Only a bad display id is rejected
-synchronously.
+b2g writes the frame file **asynchronously**. The capture request returns as
+soon as it is accepted, and measured back to back, **23 of 40 PNG frames were
+still incomplete** at that point. So the pump waits for the frame to be
+complete — `IEND` for PNG, the expected size for raw — then renames it aside
+before sending, so a late writer can never truncate the copy in flight.
 
-Measured back to back, **23 of 40 PNG frames were still incomplete when
-`gfxdebugger` returned** (with a pause between captures, none were). So the
-device waits for the frame to be complete — `IEND` for PNG, the expected size
-for raw — then renames it away before sending, so a late writer can never
-truncate the copy in flight.
+This guard used to cost a 34 ms fork and was worth making optional. It is now
+a single `stat` syscall costing ~9%, so it is unconditional and
+`--no-device-guard` is gone: skipping it produced intermittent duplicate
+frames (4 in one 150-frame run, 0 in the next) for no meaningful gain.
 
-`--no-device-guard` drops that wait and lets the host resync on the frame
-header instead. It measured clean (zero torn frames in 258 frames under
-continuously changing content) because the pipeline leaves b2g plenty of
-slack, but the guarantee is timing, not structure.
+### Verifying the frame rate is real
 
-## Making it faster
+A pump that re-ships a staged frame would inflate its rate while showing a
+stale screen, and on a static UI that is invisible in the output. So the
+numbers above were checked rather than trusted: the pump counts captures
+against frames shipped (`/data/local/tmp/kaipump.stats`), every frame is
+verified to start on a header with no trailing remainder, and IPC output is
+byte-identical to `exec` output on a static screen.
 
-Dead ends, all tested on the device:
+### Dead ends, all tested on the device
 
 - **JPEG**: does not exist on this path. `gfxdebugger` has no format strings
   at all; b2g gives you PNG or raw.
@@ -185,15 +222,12 @@ Dead ends, all tested on the device:
 - **Stage frames on tmpfs** instead of flash: `mount` is denied even as root
   under SELinux, and it would not have helped — flash was never the cost.
 
-What is left is the scrcpy-shaped fix: push a small native binary that speaks
-`/dev/socket/gfxdebugger-ipc` directly and streams frames over a socket. The
-win is not skipping flash or compression, it is collapsing every per-frame
-fork into one long-lived process. That needs an NDK cross-compile and the IPC
-parcel format (`gfxdebugger` is a 15 KB stripped ARM32 binary using
-`android::Parcel` `writeUint32`/`writeCString`/`readUint32` over a unix
-socket). Expect something near the ~24 fps capture ceiling if done.
-
 ## Files
 
 - `kaimirror.py` — host-side CLI and frame-stream reader
-- `kaimirror_device.sh` — device-side frame pump (pipelined), pushed to `/data/local/tmp`
+- `kaipump/` — device-side frame pump in Rust, statically linked for ARM32.
+  Speaks b2g's socket directly; `build.sh [--push]` builds and installs it.
+  Keeps an `exec` backend that spawns `gfxdebugger` per frame, so the claim
+  that the socket is what makes it fast stays falsifiable.
+- `kaimirror_device.sh` — the original shell pump, kept as the fallback when
+  `kaipump` has not been built

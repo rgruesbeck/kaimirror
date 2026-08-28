@@ -1,0 +1,16 @@
+[package]
+name = "kaipump"
+version = "0.1.0"
+edition = "2021"
+
+# The device has no package manager and no network; everything ships as one
+# statically linked binary pushed to /data/local/tmp.  Keep dependencies at
+# zero so the build stays a single cross-compile with no vendoring step.
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

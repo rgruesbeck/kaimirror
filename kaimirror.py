@@ -7,10 +7,11 @@ android.jar, SurfaceControl and a MediaCodec encoder bound to a virtual
 display.  /system/bin/screencap and screenrecord ship on the device but hang
 forever waiting for a SurfaceFlinger binder that never registers.
 
-What KaiOS does provide is /system/bin/gfxdebugger, which asks b2g over
-/dev/socket/gfxdebugger-ipc to dump the composited primary display to a PNG.
-That is the capture primitive.  Input injection goes through sendevent on the
-raw /dev/input nodes.  This tool wires both into a live mirror.
+What KaiOS does provide is b2g's own /dev/socket/gfxdebugger-ipc, which dumps
+the composited display to a file.  /system/bin/gfxdebugger is a thin client for
+that socket; the device-side pump speaks it directly instead, which is what
+makes the frame rate a device limit rather than a process-startup one.  Input
+injection goes through sendevent on the raw /dev/input nodes.
 
 Requires: adb root on a userdebug build, and ffplay for the viewer.
 """
@@ -28,12 +29,35 @@ from queue import Queue
 
 VERSION = "0.1.0"
 
-DEVICE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "kaimirror_device.sh")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# The native pump talks to b2g's socket directly and runs ~4x faster, but it
+# has to be cross-compiled.  The shell script stays as a fallback so a
+# checkout without an NDK still works, just slowly.
+DEVICE_PUMP = os.path.join(_HERE, "kaipump", "target",
+                           "armv7-linux-androideabi", "release", "kaipump")
+REMOTE_PUMP = "/data/local/tmp/kaipump"
+DEVICE_SCRIPT = os.path.join(_HERE, "kaimirror_device.sh")
 REMOTE_SCRIPT = "/data/local/tmp/kaimirror_device.sh"
+REMOTE_STAGING = "/data/local/tmp/.kaimirror_* /data/local/tmp/kaipump.stats"
+MAX_FPS = 30            # uncapped costs most of b2g's CPU; see README
+# Reaping a pump means killing its whole process group: an orphan wedges in
+# `cat`, blocked writing to a half-open adb socket that never returns EPIPE, so
+# signalling the shell alone leaves it stuck with the write still pending.  The
+# bracketed dot keeps the pattern from matching the shell running the sweep,
+# and the pgid compare keeps that shell from killing its own session.
+# The bracketed letters keep each pattern from matching the shell running the
+# sweep, whose own command line contains this text.
+PUMP_SWEEP = (
+    'me=$(cut -d" " -f5 /proc/$$/stat); '
+    'for p in $(pgrep -f "kaipum[p]|kaimirror_device[.]sh"); do '
+    'g=$(cut -d" " -f5 /proc/$p/stat 2>/dev/null); '
+    '[ -n "$g" ] && [ "$g" != "$me" ] && kill -9 -"$g" 2>/dev/null; '
+    'done; true'
+)
 PNG_SIG = b"\x89PNG\r\n\x1a\n"
 MAX_CHUNK = 1 << 24     # anything larger is garbage, not a 240x320 frame
 RAW_HDR = 16            # w, h, format, planes -- uint32 LE each
+KEY_HOLD = 0.05         # seconds a key is held down before the release event
 
 # Linux input event codes, per `getevent -pl` on the device.
 # matrix-keypad (event1) carries the whole keypad; the power/volume keys live
@@ -79,13 +103,27 @@ def ensure_root():
         sys.exit("error: could not get adb root (needs a userdebug/ro.debuggable build)")
 
 
-def push_script():
-    if not os.path.exists(DEVICE_SCRIPT):
-        sys.exit(f"error: missing {DEVICE_SCRIPT}")
-    adb("push", DEVICE_SCRIPT, REMOTE_SCRIPT)
+def push_pump():
+    """Install the device-side pump, and report which one got installed."""
+    if os.path.exists(DEVICE_PUMP):
+        adb("push", DEVICE_PUMP, REMOTE_PUMP)
+        adb("shell", "chmod", "755", REMOTE_PUMP)
+        kind = "native"
+    elif os.path.exists(DEVICE_SCRIPT):
+        adb("push", DEVICE_SCRIPT, REMOTE_SCRIPT)
+        print("note: native pump not built (run kaipump/build.sh) -- using the "
+              "shell fallback at ~6 fps", file=sys.stderr)
+        kind = "shell"
+    else:
+        sys.exit(f"error: no pump to push; expected {DEVICE_PUMP} or "
+                 f"{DEVICE_SCRIPT}")
+    # A pump orphaned by a host crash would fight this session over the same
+    # staging paths, so clear any before starting.
+    adb("shell", PUMP_SWEEP)
+    return kind
 
 
-def send_key(name, hold=0.05):
+def send_key(name):
     """Inject a key down/up pair via sendevent."""
     key = name.upper()
     if key not in KEYS:
@@ -94,7 +132,7 @@ def send_key(name, hold=0.05):
     dev = f"/dev/input/event{node}"
     def ev(val):
         return f"sendevent {dev} 1 {code} {val}; sendevent {dev} 0 0 0"
-    adb("shell", f"{ev(1)}; sleep {hold}; {ev(0)}")
+    adb("shell", f"{ev(1)}; sleep {KEY_HOLD}; {ev(0)}")
 
 
 def wake():
@@ -118,16 +156,22 @@ class FrameStream:
 
     raw  16-byte header (w, h, format, planes) then w*h*2 bytes of RGB565;
          the header doubles as the sync marker and reports the geometry, so
-         the cover display's 128x160 needs no special casing.
+         the cover display's 128x128 needs no special casing.
     png  walk the chunk headers to the IEND chunk.
     """
 
-    def __init__(self, delay_us=5000, display=0, fmt="raw", guard=True):
+    def __init__(self, delay_us, display, fmt, pump, max_fps=MAX_FPS):
         self.fmt = fmt
         self.geom = None    # (w, h), learned from the first raw frame header
+        if pump == "native":
+            # limit=0 streams without end; the cap is what keeps b2g off the
+            # CPU, since uncapped the pump outruns the panel several times over.
+            argv = [REMOTE_PUMP, str(delay_us), str(display), fmt,
+                    "1", "0", "ipc", str(max_fps)]
+        else:
+            argv = ["sh", REMOTE_SCRIPT, str(delay_us), str(display), fmt, "1"]
         self.proc = subprocess.Popen(
-            ["adb", "exec-out", "sh", REMOTE_SCRIPT, str(delay_us), str(display),
-             fmt, "1" if guard else "0"],
+            ["adb", "exec-out"] + argv,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.buf = b""
         self.pos = 8        # chunk-walk offset within the frame being parsed
@@ -232,6 +276,12 @@ class FrameStream:
             self.proc.kill()
         except Exception:
             pass
+        # Killing the local adb client does not reap the remote shell, and its
+        # EXIT trap only fires if it gets a signal -- so signal it, give any
+        # gfxdebugger write b2g still owes us time to land, then sweep.  Left
+        # alone the pump loops forever, re-creating the staging files and
+        # fighting the next session over the same paths.
+        adb("shell", f"{PUMP_SWEEP}; sleep 0.3; rm -f {REMOTE_STAGING}")
 
 
 def sink_input(stream, fps):
@@ -243,7 +293,7 @@ def sink_input(stream, fps):
     return ["-f", "image2pipe", "-vcodec", "png", "-framerate", str(fps), "-i", "-"]
 
 
-def pipe_to(stream, make_cmd, label, fps_report):
+def pipe_to(stream, make_cmd, label):
     # The first frame carries the geometry, so the sink cannot be built until
     # it has arrived.
     frames = stream.frames()
@@ -276,31 +326,36 @@ def pipe_to(stream, make_cmd, label, fps_report):
 
     n, t0, last = 0, time.time(), time.time()
     try:
-        for png in itertools.chain([first], frames):
+        for frame in itertools.chain([first], frames):
             if not pump.is_alive():
                 break
-            queue.put(png)
+            queue.put(frame)
             n += 1
-            if fps_report and time.time() - last >= 5:
+            if time.time() - last >= 5:
                 el = time.time() - t0
                 print(f"[{label}] {n} frames, {n/el:.1f} fps", file=sys.stderr)
                 last = time.time()
     except KeyboardInterrupt:
         pass
     finally:
-        stream.close()
+        # Every step here has to run even if an interrupt lands inside the
+        # teardown itself -- draining the queue and reaping the sink are what
+        # finalize a recording, and a KeyboardInterrupt raised in one step
+        # would otherwise skip the rest and escape as a traceback.  Each step
+        # absorbs its own, so one stray Ctrl-C costs that step and no more.
+        def quietly(fn, *args, **kw):
+            try:
+                fn(*args, **kw)
+            except (KeyboardInterrupt, Exception):
+                pass
+
+        quietly(stream.close)
         # Let the writer drain what is already queued before closing the sink,
         # so a recording keeps its last frames.
-        try:
-            queue.put(None, timeout=5)
-            pump.join(timeout=10)
-        except Exception:
-            pass
-        try:
-            sink.stdin.close()
-        except Exception:
-            pass
-        sink.wait()
+        quietly(queue.put, None, timeout=5)
+        quietly(pump.join, timeout=10)
+        quietly(sink.stdin.close)
+        quietly(sink.wait)
         el = time.time() - t0
         if n:
             print(f"[{label}] {n} frames in {el:.1f}s ({n/el:.1f} fps)", file=sys.stderr)
@@ -309,7 +364,7 @@ def pipe_to(stream, make_cmd, label, fps_report):
 def cmd_view(a):
     if not shutil.which("ffplay"):
         sys.exit("error: ffplay not found (install ffmpeg)")
-    stream = FrameStream(a.poll_delay, a.display, a.format, not a.no_device_guard)
+    stream = FrameStream(a.poll_delay, a.display, a.format, a.pump, a.max_fps)
 
     def make(s):
         cmd = ["ffplay", "-hide_banner", "-loglevel", "error"]
@@ -318,26 +373,26 @@ def cmd_view(a):
             cmd += ["-vf", f"scale=iw*{a.scale}:ih*{a.scale}:flags=neighbor"]
         return cmd + ["-window_title", "kaimirror", "-autoexit"]
 
-    pipe_to(stream, make, "view", True)
+    pipe_to(stream, make, "view")
 
 
 def cmd_record(a):
     if not shutil.which("ffmpeg"):
         sys.exit("error: ffmpeg not found")
-    stream = FrameStream(a.poll_delay, a.display, a.format, not a.no_device_guard)
+    stream = FrameStream(a.poll_delay, a.display, a.format, a.pump, a.max_fps)
 
     def make(s):
         return (["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
                 + sink_input(s, a.fps) + ["-pix_fmt", "yuv420p", a.output])
 
-    pipe_to(stream, make, "record", True)
+    pipe_to(stream, make, "record")
     print(f"wrote {a.output}", file=sys.stderr)
 
 
 def cmd_shot(a):
     # Always PNG: a single frame is not worth optimising, and PNG carries more
     # colour precision than the RGB565 raw dump.
-    stream = FrameStream(a.poll_delay, a.display, "png", True)
+    stream = FrameStream(a.poll_delay, a.display, "png", a.pump)
     try:
         for png in stream.frames():
             with open(a.output, "wb") as fh:
@@ -406,11 +461,11 @@ def capture_opts(stream, defaults=False):
                        help="stream format: raw RGB565 (default, "
                             "content-independent rate) or png (12x less "
                             "bandwidth, slower)")
-        p.add_argument("--no-device-guard", action="store_true",
-                       default=dflt(False),
-                       help="skip the device-side completeness wait and "
-                            "resync on the frame header instead: faster, but "
-                            "a torn frame becomes possible")
+        p.add_argument("--max-fps", type=positive_int, default=dflt(MAX_FPS),
+                       help=f"cap the device-side capture rate (default: "
+                            f"{MAX_FPS}).  Uncapping costs most of b2g's CPU "
+                            f"to re-capture a screen that is not changing "
+                            f"that fast; native pump only")
     return p
 
 
@@ -423,7 +478,7 @@ examples:
   kaimirror shot --display 1 cover.png
   kaimirror key DOWN OK              inject key presses (key --list for names)
   kaimirror view --format png        12x less bandwidth, painful over wifi
-  kaimirror view --no-device-guard   ~8.8 fps, torn frames become possible
+  kaimirror view --max-fps 60        uncap-ish; costs b2g a lot of CPU
 """
 
 
@@ -445,9 +500,10 @@ def build_parser():
                        description="Live mirror in an ffplay window.")
     v.add_argument("--scale", type=positive_float, default=2.0,
                    help="window magnification, nearest-neighbour (default: 2)")
-    v.add_argument("--fps", type=positive_int, default=7,
-                   help="rate declared to ffplay; the device delivers ~6.5 "
-                        "(default: 7)")
+    v.add_argument("--fps", type=positive_int, default=MAX_FPS,
+                   help=f"rate declared to ffplay; the native pump delivers "
+                        f"~{MAX_FPS}, the shell fallback ~6 "
+                        f"(default: {MAX_FPS})")
     v.set_defaults(func=cmd_view, capture=True)
 
     r = sub.add_parser("record", parents=[stream_opts], formatter_class=fmt,
@@ -457,9 +513,10 @@ def build_parser():
                                    "overwritten.")
     r.add_argument("output", help="output path; the extension picks the "
                                   "container (e.g. out.mp4)")
-    r.add_argument("--fps", type=positive_int, default=7,
-                   help="rate declared to ffmpeg; the device delivers ~6.5 "
-                        "(default: 7)")
+    r.add_argument("--fps", type=positive_int, default=MAX_FPS,
+                   help=f"rate declared to ffmpeg; the native pump delivers "
+                        f"~{MAX_FPS}, the shell fallback ~6 "
+                        f"(default: {MAX_FPS})")
     r.set_defaults(func=cmd_record, capture=True)
 
     s = sub.add_parser("shot", parents=[still_opts], formatter_class=fmt,
@@ -502,7 +559,7 @@ def main():
         return a.func(a)
     ensure_root()
     if a.capture:
-        push_script()
+        a.pump = push_pump()
         if not a.no_wake:
             wake()
     a.func(a)

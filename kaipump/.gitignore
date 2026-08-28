@@ -1,0 +1,4 @@
+target/
+# Pulled from the device for protocol work; proprietary, and no longer
+# needed now that the wire format is documented in the README.
+ref/
