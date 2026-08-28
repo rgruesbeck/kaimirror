@@ -90,6 +90,10 @@ KEYS = {
 
 
 def adb(*args, **kw):
+    # Never let adb inherit our stdin.  No adb command here needs it, and an
+    # adb client sharing the terminal swallows the keystrokes --control is
+    # trying to read.
+    kw.setdefault("stdin", subprocess.DEVNULL)
     return subprocess.run(("adb",) + args, capture_output=True, **kw)
 
 
@@ -204,6 +208,11 @@ def control_loop(ctl, stop, on_quit):
             name = CONTROL_KEYS.get(ch)
             if name:
                 ctl.send(name)
+                # Echo what was forwarded.  Without it there is no way to tell
+                # a key that never arrived (typed into the mirror window,
+                # which keeps its own keystrokes) from one that arrived and
+                # moved nothing on screen.
+                print(f"  -> {name}", file=sys.stderr, flush=True)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
@@ -256,7 +265,7 @@ class FrameStream:
         else:
             argv = ["sh", REMOTE_SCRIPT, str(delay_us), str(display), fmt, "1"]
         self.proc = subprocess.Popen(
-            ["adb", "exec-out"] + argv,
+            ["adb", "exec-out"] + argv, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         self.buf = b""
         self.pos = 8        # chunk-walk offset within the frame being parsed
@@ -466,8 +475,11 @@ def cmd_view(a):
         keys = threading.Thread(target=control_loop,
                                 args=(ctl, stop, stream.close), daemon=True)
         keys.start()
-        print("control: arrows/enter navigate, backspace=back, digits, "
-              "m=menu, q=quit", file=sys.stderr)
+        print("control: TYPE IN THIS TERMINAL -- the mirror window keeps its "
+              "own keystrokes.\n"
+              "         arrows/enter navigate, backspace=back, digits, "
+              "m=menu, q=quit.\n"
+              "         each forwarded key is echoed below.", file=sys.stderr)
     elif a.control:
         print("note: --control needs a terminal; ignoring", file=sys.stderr)
 
