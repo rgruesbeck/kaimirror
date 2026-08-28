@@ -20,16 +20,23 @@ game's load screen dropped.*
 
 ## Install
 
-You need `adb` with root on the device (KaiOS ships `userdebug` with
-`ro.debuggable=1`, so `adb root` works) and `ffmpeg`/`ffplay` on the host —
-the viewer is an ffplay window.
+kaimirror runs on Linux and macOS. You need `adb` with root on the device
+(KaiOS ships `userdebug` with `ro.debuggable=1`, so `adb root` works) and
+`ffmpeg`/`ffplay` on the host — the viewer is an ffplay window. On macOS both
+come from Homebrew:
+
+```sh
+brew install ffmpeg android-platform-tools
+```
 
 ### Download a binary
 
-The release is one file. It is statically linked against musl, so it runs on
-any x86-64 Linux without matching a glibc, and it **embeds the device pump**,
-so it installs its own other half on first use — no NDK, no Rust, no second
+The release is one file per platform. It **embeds the device pump**, so it
+installs its own other half on first use — no NDK, no Rust, no second
 download.
+
+On Linux, that file is statically linked against musl, so it runs on any
+x86-64 machine without matching a glibc:
 
 ```sh
 curl -LO https://github.com/rgruesbeck/kaimirror/releases/latest/download/kaimirror-0.2.0-x86_64-linux.tar.gz
@@ -37,40 +44,68 @@ tar xzf kaimirror-0.2.0-x86_64-linux.tar.gz
 ./kaimirror --version
 ```
 
-Put it on your `PATH` if you want it everywhere:
+On macOS it is a universal binary, so the same download covers Apple silicon
+and Intel:
 
 ```sh
-install -Dm755 kaimirror ~/.local/bin/kaimirror
+curl -LO https://github.com/rgruesbeck/kaimirror/releases/latest/download/kaimirror-0.2.0-universal-macos.tar.gz
+tar xzf kaimirror-0.2.0-universal-macos.tar.gz
+./kaimirror --version
 ```
 
-The release also carries a `SHA256SUMS`; to check the download against it:
+The binary is unsigned. `curl` leaves it alone, but a browser download picks
+up a quarantine flag that Gatekeeper refuses to run; clear it with
+`xattr -d com.apple.quarantine kaimirror`.
+
+Put it on your `PATH` if you want it everywhere — `~/.local/bin` on Linux,
+`/usr/local/bin` on macOS:
+
+```sh
+install -Dm755 kaimirror ~/.local/bin/kaimirror   # Linux
+install -m755 kaimirror /usr/local/bin/kaimirror  # macOS
+```
+
+The release carries one `SHA256SUMS` covering both tarballs, so check the
+line for the one you took:
 
 ```sh
 curl -LO https://github.com/rgruesbeck/kaimirror/releases/latest/download/SHA256SUMS
-sha256sum -c SHA256SUMS
+grep x86_64-linux SHA256SUMS | sha256sum -c -        # Linux
+grep universal-macos SHA256SUMS | shasum -a 256 -c - # macOS
 ```
 
 ### Build from source
 
-Both halves are Rust, built together:
+Both halves are Rust, built together, on either host:
 
 ```sh
 ./build.sh                # device pump + host CLI
 ./build.sh --push         # ...and install the pump on the device
-./build.sh --dist         # ...and link the host half statically, packaging dist/
+./build.sh --dist         # ...and link the host half for release, packaging dist/
 ```
 
-That needs the `armv7-linux-androideabi` target and an NDK at
-`$ANDROID_NDK_HOME` (default `~/Android/android-ndk-r27c`) to cross-compile
-the device half; `--dist` also needs `x86_64-unknown-linux-musl`.
+Cross-compiling the device half needs the `armv7-linux-androideabi` target
+and an NDK, found at `$ANDROID_NDK_HOME` or in the usual places — the
+standalone `~/Android/android-ndk-*`, or Android Studio's
+`~/Library/Android/sdk/ndk/*` on macOS. The device pump is the same ARM32
+binary on both hosts; only the host half differs, and only for `--dist`,
+which links against musl on Linux and `lipo`s the two Apple targets into one
+universal binary on macOS:
 
 ```sh
-rustup target add armv7-linux-androideabi x86_64-unknown-linux-musl
+rustup target add armv7-linux-androideabi
+rustup target add x86_64-unknown-linux-musl                 # --dist on Linux
+rustup target add aarch64-apple-darwin x86_64-apple-darwin  # --dist on macOS
 ```
 
-The binary lands at `target/release/kaimirror` (or under
-`target/x86_64-unknown-linux-musl/release/` with `--dist`, which is what a
-release ships, alongside the tarball and checksum it writes to `dist/`).
+The binary lands at `target/release/kaimirror`, or with `--dist` under
+`target/x86_64-unknown-linux-musl/release/` (Linux) or at
+`target/kaimirror-universal` (macOS), which is what a release ships alongside
+the tarball and checksum it writes to `dist/`. Neither tarball can be built
+on the other's host, so `--dist` leaves any tarball already in `dist/` alone
+and rewrites `SHA256SUMS` over everything there: build on both machines,
+collect the two files, and the checksum file covers both.
+
 Building without the NDK works for editing the host half; the pump is then
 absent and the binary says so rather than pushing a stub.
 
@@ -140,6 +175,7 @@ power first unless you pass `--no-wake`.
 - `kaimirror/` — host-side CLI, frame-stream reader and control channel
 - `kaipump/` — device-side frame pump, statically linked for ARM32; the host
   binary embeds a copy and installs it when needed
-- `build.sh` — builds both halves; `--push` also installs the pump,
-  `--dist` builds the static host binary and packages `dist/` for a release
+- `build.sh` — builds both halves on Linux or macOS; `--push` also installs
+  the pump, `--dist` builds the release host binary (musl static, or a
+  universal binary) and packages `dist/`
 - `docs/INTERNALS.md` — how capture works, the protocol, and the numbers
