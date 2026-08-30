@@ -26,7 +26,7 @@ Things that look promising but are dead ends:
 | `screencap` / `screenrecord` | Ship on the device but **hang forever** — they block on a SurfaceFlinger binder that never registers. |
 | `/dev/graphics/fb0` | Exists (240x640 virtual, RGB565, stride 512) but `read()` returns `ENODEV` — MDSS composites through overlay planes, the fb is not the scanout source. |
 | tmpfs for frame staging | `b2g` is SELinux-confined (`Enforcing`) and can only write under `/data/local/tmp`. |
-| Gecko DevTools socket | `/data/local/firefox-debugger-socket` is live (`devtools.debugger.remote-enabled=true`, no connection prompt) — a viable alternative route, not used here. |
+| Gecko DevTools socket | `/data/local/firefox-debugger-socket` is live (`devtools.debugger.remote-enabled=true`, no connection prompt) — not a capture route, but the way to read the screen as *text* rather than pixels: see [Reading the screen as text](#reading-the-screen-as-text). |
 
 ## What actually works
 
@@ -415,6 +415,86 @@ live.
 
 The cost is the wait, not the tapping: on the phone `Hello world` takes ~9 s.
 A same-key pair costs 1.4 s and a case change ~2 s on top of its presses.
+
+### Reading the screen as text
+
+**Status: designed and argued below, not yet confirmed on hardware.** No
+device was attached when this was written, so every claim here about what
+*this* build answers is a prediction; `tools/devtools-probe.py` is the one
+run that settles it.
+
+An agent driving the phone through kaimirror has to do it by looking at
+pictures: `shot`, then read the PNG, then guess where the focus ring is.
+That is the slowest and least reliable way to answer "what is on the
+screen", and it is why `imemode` ended up doing pixel forensics on a
+40-pixel crop of the status bar just to learn which input mode the IME is
+in. What an agent wants instead is what agent-browser's `snapshot` returns:
+a text tree of roles, names and focus, cheap enough to take before every
+action.
+
+That is available here in principle, because **b2g is Gecko**, and Gecko
+already ships the server that answers this question. The dead-end table
+above notes the socket:
+
+```
+/data/local/firefox-debugger-socket     devtools.debugger.remote-enabled=true
+```
+
+It speaks the Remote Debugging Protocol — the same protocol WebIDE used to
+talk to Firefox OS phones — and it is a *host-side* conversation. Nothing
+in `kaipump` changes, and no new device binary is needed: `adb forward` maps
+the unix socket to a local port and the host talks JSON to it.
+
+```sh
+adb forward tcp:6080 localfilesystem:/data/local/firefox-debugger-socket
+```
+
+Framing is `<byte-length>:<json>`, the server greets first, and events
+(`tabListChanged`, `consoleAPICall`) arrive interleaved with replies — an
+event carries a `type` and a reply does not, which is the only rule needed
+to tell them apart.
+
+Three routes sit behind that socket, in decreasing order of how much they
+give and increasing order of how likely they are to be there:
+
+| Route | Gives | Risk |
+|---|---|---|
+| accessibility walker | roles + computed names, straight from Gecko's a11y engine — the closest analogue to a browser snapshot | the engine is a build option; b2g may ship devtools without it, and the actor's shape moved across Gecko versions |
+| inspector's DOM walker | the DOM tree node by node | one round trip per node, which is a lot of round trips for a 240x320 screen |
+| `evaluateJSAsync` on the console actor | whatever a script returns — so, one round trip for the whole snapshot, in exactly the shape we want | none beyond the console actor existing, which is what devtools *is* |
+
+The third is the one to build on even if the first works: a snapshot the
+host formats itself can carry the things a KaiOS agent actually needs and a
+generic a11y tree does not — which element has focus (d-pad navigation is
+the whole interaction model), what the two soft keys currently say, and the
+list position within a scroller.
+
+Two things are genuinely unknown until the probe runs:
+
+- **Whether each app is its own target.** KaiOS composes the system app with
+  app frames inside it, so a script evaluated in the system app's window
+  cannot reach the foreground app's document across a process boundary. If
+  `listTabs` returns one target per running app, this is a non-issue; if it
+  returns only the system app, the running apps have to be reached the way
+  Firefox OS exposed them, through a `webapps` actor and `getAppActor`. The
+  probe asks for both.
+- **Whether the accessibility actor is present and enablable.** Firefox OS
+  shipped a screen reader, so the engine was compiled in then; whether this
+  build kept it is a question for the device, not for reasoning.
+
+What it would buy, beyond the snapshot itself: `imemode`'s calibration walk
+— seven seconds of frame grabs and pixel thresholding, plus the four device
+behaviours documented above that each broke it once — exists only because
+the input mode is currently readable *only* as pixels. The system app draws
+that indicator from its own DOM. Reading it as text would delete the whole
+apparatus.
+
+The shape it would take is one subcommand alongside `shot`:
+
+```sh
+kaimirror snapshot            # text tree of the foreground app
+kaimirror snapshot --target N # a specific target, for the system app's chrome
+```
 
 ### Dead ends, all tested on the device
 
