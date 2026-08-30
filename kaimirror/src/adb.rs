@@ -84,6 +84,18 @@ static PUMP: &[u8] = include_bytes!(env!("KAIPUMP_BIN"));
 /// tripled what a keypress cost.  Comparing sizes is one cheap round trip and
 /// a rebuild effectively always changes the size.
 pub fn push_pump() {
+    ensure_pump();
+    // A pump orphaned by a host crash would fight this session over the same
+    // staging paths, so clear any before starting.
+    adb(&["shell", PUMP_SWEEP]);
+}
+
+/// Install the pump without sweeping the ones already running.
+///
+/// Typing needs the binary on the device, but not a clean slate: sweeping
+/// would kill the frame pump of a `view` running in another terminal, which
+/// is exactly the session someone is watching while they type.
+pub fn ensure_pump() {
     if PUMP.is_empty() {
         fail("this kaimirror was built without a device pump (run ./build.sh)");
     }
@@ -100,9 +112,6 @@ pub fn push_pump() {
         adb(&["shell", "chmod", "755", REMOTE_PUMP]);
         let _ = std::fs::remove_file(&staged);
     }
-    // A pump orphaned by a host crash would fight this session over the same
-    // staging paths, so clear any before starting.
-    adb(&["shell", PUMP_SWEEP]);
 }
 
 /// Inject one key press over its own adb round trip.  Fine for `kaimirror
@@ -123,6 +132,26 @@ pub fn send_key(name: &str) {
     if !out.status.success() || String::from_utf8_lossy(&out.stderr).contains("not found") {
         push_pump();
         adb(&["shell", REMOTE_PUMP, "key", &node, &code]);
+    }
+}
+
+/// Panel brightness, 0 when the screen is blanked.
+pub fn backlight() -> i32 {
+    stdout_of(&adb(&["shell", "cat /sys/class/leds/lcd-backlight/brightness"]))
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Light the panel, but only if it is dark.
+///
+/// POWER *toggles*, so tapping it blindly is as likely to blank a lit screen
+/// as to wake a dark one -- which is why `wake` is a command the user asks
+/// for and this is what code calls.
+pub fn ensure_lit() {
+    if backlight() == 0 {
+        send_key("POWER");
+        thread::sleep(Duration::from_secs(1));
     }
 }
 

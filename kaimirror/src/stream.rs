@@ -33,6 +33,13 @@ pub struct FrameStream {
 
 impl FrameStream {
     pub fn new(display: u32, png: bool, fps: u32) -> Self {
+        Self::tagged(display, png, fps, "")
+    }
+
+    /// A stream whose device-side staging files carry `tag`, so a caller that
+    /// kills the pump can still clear them.  An empty tag lets the pump use
+    /// its pid, which is right for a stream that ends by itself.
+    pub fn tagged(display: u32, png: bool, fps: u32, tag: &str) -> Self {
         let fmt = if png { "png" } else { "raw" };
         // limit=0 streams without end; the cap is what keeps b2g off the CPU,
         // since uncapped the pump outruns the panel several times over.
@@ -40,7 +47,7 @@ impl FrameStream {
             .args(["exec-out", adb::REMOTE_PUMP])
             .args([
                 &POLL_DELAY_US.to_string(), &display.to_string(), fmt,
-                "1", "0", "ipc", &fps.to_string(),
+                "1", "0", "ipc", &fps.to_string(), tag,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -183,6 +190,17 @@ impl FrameStream {
         if self.png { self.next_png() } else { self.next_raw() }
     }
 
+    /// Stop reading without sweeping the device.
+    ///
+    /// `close` kills every pump on the device, which is right when a session
+    /// ends but fatal for a one-frame grab taken *during* a mirror -- it
+    /// would take the mirror down with it.  The pump this owns exits on its
+    /// own once its stdout write fails.
+    pub fn close_local(&mut self) {
+        let _ = self.proc.kill();
+        let _ = self.proc.wait();
+    }
+
     pub fn close(&mut self) {
         let _ = self.proc.kill();
         let _ = self.proc.wait();
@@ -196,4 +214,28 @@ impl FrameStream {
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Grab a single raw frame, leaving any mirror running.
+///
+/// Costs about a second, nearly all of it starting the pump, which is why
+/// the callers that need it (reading the phone's input mode off the status
+/// bar) do it once per mode change rather than per keystroke.
+pub fn grab(display: u32) -> Option<(Vec<u8>, u32, u32)> {
+    // The panel has to be lit: a blanked screen still composites, and every
+    // grab comes back a valid black frame with no status bar in it -- which
+    // reads as "the mode indicator is missing" rather than as "look again".
+    adb::ensure_lit();
+    const TAG: &str = "grab";
+    let mut stream = FrameStream::tagged(display, false, crate::cli::DEFAULT_FPS, TAG);
+    let frame = stream.next_frame();
+    let geom = stream.geom;
+    stream.close_local();
+    // This pump is killed rather than allowed to finish, so it never runs its
+    // own cleanup; without this the staging files pile up one pair per grab.
+    adb::adb(&["shell", &format!("rm -f /data/local/tmp/.kaimirror_?{TAG}.raw")]);
+    match (frame, geom) {
+        (Some(frame), Some((w, h))) => Some((frame, w, h)),
+        _ => None,
+    }
 }

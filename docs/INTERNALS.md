@@ -211,6 +211,211 @@ dominated by b2g's own repaint plus the capture pipeline rather than by the
 transport; varying the key hold between 5 ms and 50 ms does not move it
 outside the noise.
 
+### Typing on a keypad
+
+A flip phone's keypad cannot carry letters, and not for want of scancodes:
+`event1` *has* `KEY_A` (30), but the device's keylayout binds it to the **left
+soft key**. Every letter code on that node is already spoken for. Injecting
+"a" there presses a soft key.
+
+So typing goes on the keypad the phone already has, by multi-tap — the way
+its own user types. The section after this one is how; this one is the
+obvious alternative, and why it is not here.
+
+#### The keyboard that was not read
+
+A second input device would have carried letters exactly: the pump created
+one through `/dev/uinput` — a plain US keyboard named `kaimirror-keyboard`,
+which b2g has no `.kl` for and therefore reads through Android's `Generic.kl`
+and `Generic.kcm`, shift included. It was built, measured on a T435SP, and
+**removed**. Every piece worked except the one that matters:
+
+- `/dev/uinput` is there, and the SELinux domain `adb root` lands in can open
+  it. Creating a real keyboard succeeds.
+- **b2g never sees it.** Gecko's `EventHub` enumerates `/dev/input` once at
+  startup and holds *no inotify watch* — `/proc/<b2g>/fd` has no inotify
+  descriptor at all — so a device created afterwards is never opened. Its
+  keystrokes go nowhere.
+- Given the keyboard *before* it starts (create it, then restart b2g),
+  EventHub picks it up exactly as designed:
+  `New device: ... name='kaimirror-keyboard', keyLayout='/system/usr/keylayout/Generic.kl', keyCharacterMap='/system/usr/keychars/Generic.kcm'`,
+  and Gecko then dispatches real letters —
+  `KeyEventDispatcher::Dispatch ... mDOMKeyCode = :65 ... scanCode = :30` for
+  `KEY_A`. The keylayout half of the idea was sound.
+- Even then, **nothing lands in a text field.** KaiOS's IME owns text entry,
+  and a physical keyboard's characters do not become text the way keypad
+  presses do.
+
+That last point is what settles it: even the version of this that requires
+restarting b2g does not type. Nothing short of a build change would make it
+work, so the `uinput` code, the scancode table, the `u CODE SHIFT` line in
+the control protocol and the probe that chose between the two are all gone.
+What is left is one typing path, which is also the one that works.
+
+### Multi-tap
+
+"c" as three presses of `2` inside the tap timeout, and a QWERTY keyboard on
+the host end of it: the user types a letter, and the host works out which key
+it sits on and how many taps in.
+
+It runs **entirely on the host**. Multi-tap is nothing but ordinary keypad
+presses with timing between them, so it reuses the existing `NODE CODE`
+channel and the device half is unchanged. Host-side sleeps are accurate
+enough for this because the pipe write is ~0.3 ms against a tap timeout near
+700 ms.
+
+Every number below was measured on the phone, and every one of them was wrong
+in the first draft. `hello` came out as `hEko`, which is what a plan looks
+like when three separate assumptions are each off by a little:
+
+| What | Assumed | Measured |
+|---|---|---|
+| `#` presses per mode change | one per mode | **one wake press, then one per mode** — the first press of a burst only raises the banner |
+| The mode ring | `Abc → abc → ABC → 123` | **`abc → ABC → 123 → symbols → abc`**; `Abc` is a start state the first switch leaves and nothing returns to |
+| After a switch | type immediately | **wait ~1.8 s** — the mode banner sits over the field and *eats* keys rather than queueing them |
+| Gap between taps of one key | 80 ms | **≥120 ms**; at 80 ms the IME drops taps, and three taps land as the second letter |
+| Gap that commits a character | 900 ms | **~1 s** — 900 ms merges two taps into one character, 1200 ms does not |
+| The `1` key's cycle | 33 guessed symbols | **13 measured**: `. , ? ! 1 ; : / @ - + _ =`, wrapping after thirteen |
+
+The last one is the one that would have been quietly wrong forever: quotes,
+apostrophe, brackets, `%`, `&` and `*` are not on that key at all — they live
+behind the symbols mode, which is a picker rather than a cycle. They are now
+reported as untypeable instead of typed as whatever sits at that position.
+
+With those corrected, `Kai 42, ok? (yes)` types as `Kai 42, ok? yes` with the
+parentheses named in a note, and `Hello world` types clean. It costs about
+9 s for 11 characters — the waits, not the taps.
+
+The hard part is not the tapping, it is the IME's mode -- and after three
+failed attempts to model it, it is now **read off the screen** instead.
+
+Modelling it failed because every fact a model needs turned out to be false
+somewhere:
+
+- The first `#` of a burst sometimes only raises the mode banner and changes
+  nothing. Four presses on a T435SP move three modes.
+- The cycle is not the same everywhere, and it has a fifth entry (symbols)
+  that the first version did not know about.
+- **The IME moves on its own.** Type `. ` and the indicator returns to `Ab`
+  without anyone pressing anything, so a mode that was right two characters
+  ago is wrong now.
+
+So `multitap` no longer counts presses. A plan emits `Step::Mode(Case)` -- a
+request -- and the executor satisfies it by grabbing a frame, reading the
+indicator KaiOS already draws in the status bar, pressing `#`, and looking
+again. `imemode` calibrates once by walking the cycle and keeping each mode's
+pixels, then matches later readings against them; it finds lowercase among
+them by the one property that separates it from every other mode, which is
+that its first character is x-height and so starts *lower* than its second.
+No glyph recognition, no font assumptions, and a build that reorders its cycle
+changes nothing.
+
+Four device behaviours make this fussier than it sounds, all found the hard
+way:
+
+- **A blanked panel still composites — and freezes.** It does not go black:
+  every grab returns the *same* frame the panel last showed, field and status
+  bar and a clock stopped at the minute it blanked. That reads as a perfectly
+  good indicator which simply never changes, so the walk presses `#` until it
+  gives up.
+
+  Lighting it once before each switch is **not enough**, and that took a second
+  round to learn. A walk is a press-and-look loop that can run the better part
+  of a minute — calibration, then up to a full lap of the ring, each round a
+  frame grab plus the banner wait — and the phone's screen timeout fires
+  *inside* it. So the panel is lit at the frame grab, the one place a picture
+  is actually taken, and only if it is dark, because power *toggles*.
+
+  The signature is unmistakable once seen, which is why the walk now reports
+  what it read on the way: `saw Lower -> Lower -> Lower -> Lower -> Lower ->
+  Lower` is a frozen panel, not a mode cycle that will not turn.
+- **`#` reaches the dialer when nothing is focused** — which is how one walk
+  typed `2###########` into a phone number with CALL one key away. The walk
+  stops after a *single* press that changes nothing, rather than after twelve;
+  two dead presses is the whole budget, and a session that has seen one stops
+  trying until the user navigates.
+
+  It was believed for a while that an *empty* field did this too, and a switch
+  therefore happened inside a throwaway character deleted afterwards. **That
+  was wrong, and the throwaway did real damage.** Pressing `#` by hand into an
+  empty focused Note, reading the indicator after each press, walks the whole
+  cycle — `Ab → ab → AB → 12 → symbols → Ab` — with the field empty
+  throughout and no dialer anywhere. The original diagnosis had come from runs
+  where *no field was focused at all*, and an empty field was blamed for it.
+
+  What the throwaway cost: its `DEL` was unconditional, so wherever the
+  character had already gone it deleted the user's own text instead, and on an
+  empty field it is not a delete at all — the Note editor reads it as "go
+  back" and closes. It emptied an SMS draft and lost the focus in the middle
+  of nearly every typing run before it was traced. Both keypresses are gone,
+  and a mode switch is two presses cheaper for it.
+- **The status bar is not always dark.** KaiOS draws it dark green over
+  Contacts and cream over the Note editor, so thresholding on "text is the
+  brightest thing in the bar" reads a light bar as solid ink and throws it
+  away as unreadable. The cut is the midpoint of the crop's own range, and
+  the polarity is chosen by which class is the *minority* — glyphs are, on
+  either kind of bar. A crop whose range is under 60 (of ~250) has no text
+  in it at all and says so, which is what keeps the flat mode banner from
+  being recorded as a mode of its own.
+- **The banner outlasts the wait.** The pause after each `#` was 900 ms
+  against a banner that measures ~1.8 s, so every read landed on a blank bar
+  and retried: a single mode switch cost tens of seconds of frame grabs.
+  Waiting 1.9 s up front costs one second and saves six. Calibration then
+  runs in ~7 s on a T435SP, end to end.
+
+One more, and it is about the *terminal* rather than the phone: a failed mode
+switch used to drop the session back into nav mode. Everything the user had
+already typed was still sitting in the terminal buffer, and nav mode replays
+it as **navigation** -- `Hi 42.` typed `4`, `2` and the right soft key on the
+phone after the case failed. A typing error now throws the queue away and
+stays in text mode.
+
+Two tables (`KEYPAD` and `PUNCT`) are the whole device-specific
+surface — everything else follows from them.
+
+#### Testing it without a phone
+
+A simulator carries the measured device — the commit timeout at the slower of
+the two phones, the 120 ms tap floor, the sentence case the IME asserts for
+itself, and a mode switch as the three real keypresses it is (`2`, the `#`
+walk, `DEL`) rather than as a free assertion. Plans are run through it and
+read back into text, and the text has to match what was asked for:
+
+- **every ordered pair** of the 75 typeable characters — 5,625 of them;
+- **every ordered triple** — 421,875, which is the shortest shape that can
+  catch a mode switch landing between two characters that share a key;
+- **2,000 seeded random lines** of up to 200 characters over the whole
+  alphabet, and 4,000 more over a cramped one (`abcABCmno. `) where key
+  collisions and case flips are the norm rather than the exception;
+- runs of one key, a settle in the middle (the user leaving text mode and
+  coming back), and a handful of realistic lines.
+
+Plus a price: `hello world` must cost exactly one mode switch, `hi. there
+friend` exactly two. A plan that is correct but asks the screen a question
+per character is a plan nobody would wait for.
+
+Modelling the switch as something that happens on the device, rather than as
+a free assertion, is what earned the simulator its keep. It first found the
+bug in the throwaway era: that `2` was a tap like any other, so a character
+still mid-cycle on key 2 was *extended* by it and the `DEL` then deleted both
+— `aB` lost its `a`.
+
+The throwaway is gone, and the same hazard survived it in a subtler form. A
+switch presses no keypad key at all now, only `#`, so it commits nothing by
+being a keypress — it commits only by taking time. A walk of several `#`
+presses takes seconds and commits whatever was pending on its own, but the
+look-first check can return after a single frame grab without pressing
+anything, and that is not long enough. So the model prices a switch at its
+*fastest*, and a plan still has to emit a wait before every mode request.
+Taking that wait back out fails nine tests.
+
+What none of this can test is whether the model matches the phone; `KEYPAD`
+and `PUNCT`, and the four measured timings, are where a disagreement would
+live.
+
+The cost is the wait, not the tapping: on the phone `Hello world` takes ~9 s.
+A same-key pair costs 1.4 s and a case change ~2 s on top of its presses.
+
 ### Dead ends, all tested on the device
 
 - **JPEG**: does not exist on this path. `gfxdebugger` has no format strings

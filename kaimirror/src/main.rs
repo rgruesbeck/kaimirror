@@ -18,7 +18,9 @@
 mod adb;
 mod cli;
 mod control;
+mod imemode;
 mod keys;
+mod multitap;
 mod sink;
 mod stream;
 
@@ -51,12 +53,23 @@ fn main() {
             adb::wake();
         }
     }
+    // `type` and `mode` need the pump too, and both read the input-mode
+    // indicator off a captured frame -- which needs a lit panel, since a
+    // blanked one still composites and grabs as a valid frame with no status
+    // bar in it.  `ensure_lit`, not `wake`: power *toggles*, so tapping it
+    // blindly is as likely to blank a lit screen as to light a dark one.
+    if matches!(cmd.as_str(), "type" | "mode") {
+        adb::ensure_pump();
+        adb::ensure_lit();
+    }
 
     match cmd.as_str() {
         "view" => cmd_view(&a),
         "record" => cmd_record(&a),
         "shot" => cmd_shot(&a),
         "key" => cmd_key(&a),
+        "type" => cmd_type(&a),
+        "mode" => cmd_mode(&a),
         "wake" => cmd_wake(),
         _ => unreachable!("cli::parse only accepts known commands"),
     }
@@ -73,16 +86,12 @@ fn cmd_view(a: &cli::Args) {
     // rather than from the mirror window.
     let mut control = None;
     if a.control && control::is_tty() {
-        if let Some(mut ctl) = control::Controller::new() {
+        if let Some(mut ctl) = control::Controller::new(a.display) {
             let stop = Arc::new(AtomicBool::new(false));
             let flag = stop.clone();
-            eprintln!(
-                "control: TYPE IN THIS TERMINAL -- the mirror window keeps its own keystrokes.\n\
-                 \x20        arrows/enter navigate, backspace=back, digits, m=menu, q=quit.\n\
-                 \x20        each forwarded key is echoed below."
-            );
+            eprintln!("{}", control::NAV_HELP);
             let handle = thread::spawn(move || {
-                control::control_loop(&mut ctl, flag);
+                control::control_loop(&mut ctl, flag, control::Mode::Nav);
                 ctl.close();
             });
             control = Some((stop, handle));
@@ -148,6 +157,92 @@ fn cmd_shot(a: &cli::Args) {
         }
         None => adb::fail("no frames from device (is the panel awake?)"),
     }
+}
+
+/// Calibrate the input-mode reader and report what it sees.
+///
+/// Its own command because the answer is worth seeing directly: if this
+/// cannot name the mode, multi-tap cannot control case, and the reason
+/// belongs on screen rather than buried in a typing run.
+fn cmd_mode(a: &cli::Args) {
+    let Some(mut ctl) = control::Controller::new(a.display) else {
+        adb::fail("could not open the control channel");
+    };
+    println!("reading the phone's input mode (focus a text field first)...");
+    // Deliberately the same calls typing makes, rather than a private
+    // shortcut: this command exists to prove that path works.  Both cases,
+    // because typing needs both and a cycle can be walkable to one and not
+    // the other.
+    let mut failed = None;
+    for want in [imemode::Case::Lower, imemode::Case::Upper] {
+        match ctl.reach_case(want) {
+            Ok(()) => println!("input mode: reached {want:?}"),
+            Err(e) => {
+                println!("input mode: {want:?} FAILED: {e}");
+                failed = Some(e);
+                // No second attempt after a failure that says nothing is
+                // listening: the retry's own keypresses are the damage.
+                break;
+            }
+        }
+    }
+    ctl.dump_modes();
+    ctl.close();
+    if let Some(e) = failed {
+        adb::fail(&e);
+    }
+}
+
+/// Type text on the device, without a mirror window.
+///
+/// The same channel `view --control` types over, opened for one line: it is
+/// how typing gets verified on a phone, and how a script fills a field.
+fn cmd_type(a: &cli::Args) {
+    // Nothing to type means type *live*: the terminal becomes the phone's
+    // keyboard until Ctrl-C.  That is the way this is actually used -- a
+    // fixed string is for scripts -- so it is what bare `type` does.
+    if a.positionals.is_empty() {
+        if !control::is_tty() {
+            adb::fail("give the text to type, e.g. `kaimirror type \"hello world\"`, \
+                       or run it from a terminal to type live");
+        }
+        return type_live(a);
+    }
+    // Separate arguments are joined with spaces, so an unquoted `type hello
+    // world` does the obvious thing rather than typing "helloworld".
+    let text = a.positionals.join(" ");
+    let Some(mut ctl) = control::Controller::new(a.display) else {
+        adb::fail("could not open the control channel (is adb still connected?)");
+    };
+    let typed = ctl.type_text(&text);
+    // Waiting, not killing: the device is still draining the queued keys,
+    // and killing the pump would discard whatever is left of them.
+    ctl.finish();
+    let skipped = match typed {
+        Ok(skipped) => skipped,
+        Err(e) => adb::fail(&e),
+    };
+    if !skipped.is_empty() {
+        let list: Vec<String> = skipped.iter().map(|c| format!("{c:?}")).collect();
+        eprintln!("note: no way to type {} on this device -- skipped", list.join(", "));
+    }
+}
+
+/// Forward terminal keystrokes to the phone until Ctrl-C, with no mirror
+/// window.
+///
+/// The same loop `view --control` runs, started in text mode rather than nav:
+/// what is wanted here is a keyboard, and the phone's screen is the phone's
+/// own to look at.
+fn type_live(a: &cli::Args) {
+    let Some(mut ctl) = control::Controller::new(a.display) else {
+        adb::fail("could not open the control channel (is adb still connected?)");
+    };
+    eprintln!("{}", control::TYPE_HELP);
+    control::control_loop(&mut ctl, Arc::new(AtomicBool::new(false)), control::Mode::Text);
+    // Waiting rather than killing: the last character may still be queued on
+    // the device.
+    ctl.finish();
 }
 
 fn cmd_key(a: &cli::Args) {

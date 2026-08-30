@@ -119,6 +119,8 @@ kaimirror view --scale 3
 kaimirror record out.mp4           # Ctrl-C to finalize
 kaimirror shot screen.png
 kaimirror key DOWN OK              # inject key presses
+kaimirror type                     # terminal becomes the phone's keyboard
+kaimirror type "hello world"       # ...or type one line and exit
 kaimirror wake                     # tap power so the panel is lit
 kaimirror shot --display 1 cover.png
 kaimirror view --control           # drive the phone from the terminal
@@ -145,13 +147,109 @@ type:
 |---|---|
 | arrows | UP / DOWN / LEFT / RIGHT |
 | enter | OK |
-| backspace | BACK |
-| digits, `*`, `#` | themselves |
+| backspace | back (48 — also the delete key) |
+| Ins | left soft key |
+| PgUp | right soft key |
+| Del | green / call |
+| PgDn | red (116, on the power node) |
+| digits, `*`, `#` | the keypad keys themselves |
 | `m` | MENU |
-| `c` | CALL |
-| `,` / `.` | left / right soft key |
 | `-` / `+` | volume down / up |
-| `q`, Ctrl-C | quit |
+| tab | switch between nav and text mode |
+| Esc, Ctrl-C | quit |
+
+A digit in nav mode is the phone's **keypad key**, which is a menu shortcut in
+a list and a *multi-tap* in a text field — `5` there types `j`, not `5`, since
+that key carries `jkl5`. Use text mode to type a digit: it taps four times to
+reach the end of the cycle and lands a real `5`.
+
+The phone keys with no keyboard equivalent sit on the **navigation cluster**
+rather than on punctuation, so `,` `.` and `c` stay typeable and the cluster
+keys — which mean nothing to a phone text field — keep working in text mode
+too, the way the arrows do.
+
+Two of those were settled by watching `getevent` while the handset's own keys
+were pressed, rather than by reading a table. **Back is code 48**, the one the
+keylayout calls `DEL`: back and delete are one physical key, deleting a
+character where there is one and going back where there is not. Code 158 —
+whose *kernel* name is `KEY_BACK`, which is how it got mistaken for one — is
+the right soft key and nothing else. **Red is `KEY_POWER` on the power node**,
+the same switch as the power button, so the phone decides from press length
+whether it means "go back" or "blank the screen"; a tap backs out of an app.
+
+### Typing
+
+The keypad has no letters, so `--control` has a **text mode**: press `tab`,
+and everything you type — lower and upper case, digits, and the printable
+ASCII symbols — goes to the phone as typed characters. `tab` again (or `Esc`)
+returns to nav mode, `Ctrl-C` still quits, and the arrow keys keep working in
+both, moving the caret inside a field.
+
+```
+tab                    switch to text mode
+Hello, world! $9.99    typed on the phone
+tab                    back to nav mode
+```
+
+`kaimirror type` gives you the same text mode without a mirror window: the
+terminal becomes the phone's keyboard from the first keystroke until Ctrl-C.
+`kaimirror type "hello world"` types one line and exits, for scripts. Either
+way, point the phone at a text field first — keystrokes go wherever the focus
+is.
+
+```sh
+kaimirror type            # type here, it lands there; Ctrl-C to stop
+```
+
+Text goes onto the phone by the keypad's own **multi-tap** — `c` as three
+presses of `2` — because that is the only input path a KaiOS device reads.
+The keypad node cannot carry letters (`KEY_A` there *is* the left soft key),
+and the obvious way around that, a virtual QWERTY keyboard on `/dev/uinput`,
+was built and then removed: b2g enumerates `/dev/input` once at startup and
+never rescans, so a keyboard created afterwards is never opened and every
+keystroke on it is discarded. See
+[docs/INTERNALS.md](docs/INTERNALS.md#the-keyboard-that-was-not-read) for what
+that took to establish.
+
+So typing is slow but real: about 9 seconds for `Hello world`, since two
+characters on one key must wait out the ~1 s commit timeout and a change of
+case costs a mode switch plus the ~1.8 s the mode banner spends covering the
+field.
+
+Case is the hard part, and the tool no longer guesses at it. KaiOS shows the
+current input mode in the status bar (`Ab`, `ab`, `AB`, `123`, symbols), so
+multi-tap **reads that indicator off a captured frame**, presses `#`, and
+looks again until the phone says what was asked for. Nothing is counted or
+assumed, which matters because all three assumptions a model would need are
+wrong somewhere: the first `#` of a burst sometimes only raises the mode
+banner, the cycle differs between builds, and the IME switches itself back to
+sentence mode after a sentence ends.
+
+That has two requirements worth knowing. The panel must be **lit** — a blanked
+one does not stop compositing, it freezes, and every grab of it returns the
+same plausible frame with a stopped clock, so the indicator never changes
+however many times `#` is pressed. The tool lights it at every frame grab
+(a walk can outlast the screen timeout on its own), and only if it is
+actually dark, since power *toggles*. And something must be
+**focused**: with no text field listening, `#` goes to the **dialer**, so a
+switch types a phone number rather than changing mode. The tool gives up after
+a single `#` that changes nothing rather than walking a whole cycle into one.
+An *empty* focused field is fine — that was tested by hand, one `#` at a time,
+and the cycle runs `Ab → ab → AB → 12 → symbols → Ab` with the field empty
+throughout.
+
+Not every character is reachable. The `1` key's cycle on the tested phones is
+`. , ? ! 1 ; : / @ - + _ =`; quotes, apostrophe, brackets, `%`, `&` and `*`
+live behind a symbols picker the tool does not drive, so they are **reported
+rather than typed wrong**:
+
+```
+$ kaimirror type "Kai 42, ok? (yes)"
+note: no way to type '(', ')' on this device -- skipped
+```
+
+See [docs/INTERNALS.md](docs/INTERNALS.md#typing-on-a-keypad) for how each of
+those numbers was measured.
 
 Type in the **terminal**, not the mirror window — ffplay keeps its own key
 handling and offers no way to forward keystrokes. A keypress reaches the

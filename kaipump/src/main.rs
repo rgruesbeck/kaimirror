@@ -1,10 +1,15 @@
 //! Device-side frame pump for kaimirror.
 //!
 //! usage: kaipump [delay_us] [display] [raw|png] [guard 0|1] [limit]
-//!               [ipc|exec] [max_fps]
+//!               [ipc|exec] [max_fps] [staging_tag]
 //!        kaipump probe
 //!        kaipump key NODE CODE [hold_ms]
 //!        kaipump control
+//!
+//! `control` reads one line per key: "NODE CODE [hold_ms]", a phone key on
+//! its own /dev/input node.  Text goes on the same nodes -- the host types by
+//! multi-tap on the keypad, so from here a letter is indistinguishable from
+//! any other keypress.
 //!
 //! This replaces kaimirror_device.sh, whose cost was dominated by process
 //! startup rather than by capture.  Every external command on this hardware
@@ -69,8 +74,10 @@ fn control() {
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { return };
         let mut f = line.split_whitespace();
-        let (Some(node), Some(code)) = (f.next(), f.next()) else { continue };
-        let (Ok(node), Ok(code)) = (node.parse(), code.parse()) else { continue };
+        let Some(head) = f.next() else { continue };
+
+        let Some(code) = f.next() else { continue };
+        let (Ok(node), Ok(code)) = (head.parse(), code.parse()) else { continue };
         let hold = f.next().and_then(|s| s.parse().ok()).unwrap_or(KEY_HOLD_MS);
         // A key that fails to inject must not take the channel down with it.
         let _ = send_key(node, code, Duration::from_millis(hold));
@@ -151,12 +158,16 @@ struct Pump {
 
 impl Pump {
     fn new(delay_us: u64, display: u32, png: bool, guard: bool, backend: Backend,
-           max_fps: u32) -> Self {
+           max_fps: u32, tag: &str) -> Self {
         let ext = if png { "png" } else { "raw" };
         // Staged frames keep the .kaimirror_ prefix so the host's existing
-        // REMOTE_STAGING glob still sweeps them.
-        let w = PathBuf::from(format!("/data/local/tmp/.kaimirror_w.{ext}"));
-        let r = PathBuf::from(format!("/data/local/tmp/.kaimirror_r.{ext}"));
+        // REMOTE_STAGING glob still sweeps them, and carry the pid so two
+        // pumps never share a path.  They do overlap now: reading the IME
+        // mode off the screen means grabbing a frame while a mirror is
+        // already streaming, and on one staging path each would truncate the
+        // other's frames.
+        let w = PathBuf::from(format!("/data/local/tmp/.kaimirror_w{tag}.{ext}"));
+        let r = PathBuf::from(format!("/data/local/tmp/.kaimirror_r{tag}.{ext}"));
         let request = screencap_request(display, &w);
         Pump {
             w, r, png, display, guard, backend, request,
@@ -342,6 +353,17 @@ fn probe() {
         }
         Err(e) => println!("ipc socket     FAILED: {e}"),
     }
+    // Typing goes on the keypad itself, so what matters is that this
+    // domain can open the node the keys are written to -- SELinux is
+    // Enforcing here, and a refusal there is the difference between "typing
+    // is slow" and "typing does nothing".
+    for node in [0u32, 1, 2] {
+        let path = format!("/dev/input/event{node}");
+        match fs::OpenOptions::new().write(true).open(&path) {
+            Ok(_) => println!("input event{node}   ok, writable"),
+            Err(e) => println!("input event{node}   FAILED: {e}"),
+        }
+    }
     let found: Vec<&str> = ["/system/bin/gfxdebugger", "/system/xbin/gfxdebugger"]
         .into_iter()
         .filter(|p| Path::new(p).exists())
@@ -390,8 +412,13 @@ fn main() {
     // 0 uncaps.  30 is a deliberate default: the panel does not update faster,
     // and uncapped costs most of b2g's CPU for frames nobody sees.
     let max_fps: u32 = arg(6, "30").parse().unwrap_or(30);
+    // The staging tag keeps two pumps off each other's files -- reading the
+    // IME mode grabs a frame while a mirror is streaming.  A caller that
+    // intends to kill this pump rather than let it finish passes its own tag,
+    // so it can clear the files afterwards; everything else uses its pid.
+    let tag = args.get(7).cloned().unwrap_or_else(|| std::process::id().to_string());
 
-    let mut pump = Pump::new(delay_us, display, png, guard, backend, max_fps);
+    let mut pump = Pump::new(delay_us, display, png, guard, backend, max_fps, &tag);
     pump.cleanup();
     let result = pump.run(limit);
     pump.cleanup();

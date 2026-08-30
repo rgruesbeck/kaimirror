@@ -27,7 +27,7 @@ pub struct Args {
     pub positionals: Vec<String>,
 }
 
-const COMMANDS: &[&str] = &["view", "record", "shot", "key", "wake"];
+const COMMANDS: &[&str] = &["view", "record", "shot", "key", "type", "mode", "wake"];
 
 fn bad(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -121,6 +121,15 @@ const STREAM_OPTS: &str = "\
                      video
 ";
 
+const TYPING_NOTE: &str = "\
+typing (`type`, and text mode in `view --control`):
+  Text goes onto the phone's own keypad by multi-tap -- 2=abc, 7=pqrs, and
+  so on -- because that is the only input path a KaiOS device actually
+  reads.  Case is not declared and not counted: it is read off the phone's
+  own input-mode indicator in a captured frame, so the panel must be lit
+  and a text field focused before typing starts.
+";
+
 pub fn help(cmd: Option<&str>) -> String {
     match cmd {
         Some("view") => format!(
@@ -130,9 +139,12 @@ pub fn help(cmd: Option<&str>) -> String {
              \x20 --control          forward terminal keystrokes to the device over a\n\
              \x20                    persistent channel (~0.3ms per key against ~140ms for\n\
              \x20                    `kaimirror key`); needs a TTY.  Type in the terminal:\n\
-             \x20                    the mirror window keeps its own keystrokes\n\
+             \x20                    the mirror window keeps its own keystrokes.  TAB\n\
+             \x20                    switches to text mode, where letters, digits and\n\
+             \x20                    symbols type on the phone; tab or Esc switches\n\
+             \x20                    back\n\
              \x20 --scale F          window magnification, nearest-neighbour (default: 2)\n\
-             {STREAM_OPTS}\n{CAPTURE_OPTS}"),
+             {STREAM_OPTS}\n{TYPING_NOTE}\n{CAPTURE_OPTS}"),
         Some("record") => format!(
             "usage: kaimirror record [options] OUTPUT\n\n\
              Record the screen to a video file.  Ctrl-C finalizes it; an\n\
@@ -154,6 +166,24 @@ pub fn help(cmd: Option<&str>) -> String {
                  options:\n\x20 --list             print the known key names and exit\n\n\
                  key names:\n{listed}\n")
         }
+        Some("type") => format!(
+            "usage: kaimirror type [TEXT ...]\n\n\
+             Type on the device from a QWERTY keyboard: letters in both cases,\n\
+             digits, space, enter and the punctuation the keypad can reach.\n\n\
+             With no TEXT, the terminal becomes the phone's keyboard: what you\n\
+             type here lands there, until Ctrl-C.  TAB switches to nav mode\n\
+             (arrows, m=menu, q=quit) and back.  With TEXT, that text is typed\n\
+             once and the command exits; arguments are joined with spaces.\n\n\
+             Focus a text field on the phone first, and leave the panel lit --\n\
+             the case comes off the phone's own input-mode indicator, read from\n\
+             a captured frame.  Characters the keypad has no tap path for --\n\
+             quotes, brackets, `%`, `&` and the rest of the symbol picker --\n\
+             are reported and skipped rather than typed as something else.\n\n\
+             examples:\n\
+             \x20 kaimirror type                     type live from the terminal\n\
+             \x20 kaimirror type \"hello world\"\n\
+             \x20 kaimirror type 'Password1.'\n\n\
+             {TYPING_NOTE}"),
         Some("wake") => "usage: kaimirror wake\n\n\
              Tap power to light the panel.  Power *toggles*: if the panel was\n\
              already lit, this turns it off.\n".to_string(),
@@ -170,6 +200,7 @@ pub fn help(cmd: Option<&str>) -> String {
              \x20 record OUTPUT      record the screen to a video file\n\
              \x20 shot [OUTPUT]      save a single screenshot\n\
              \x20 key KEY [KEY ...]  inject key presses (key --list for names)\n\
+             \x20 type [TEXT]        type from the terminal, or type TEXT once\n\
              \x20 wake               tap power to light the panel\n\n\
              {CAPTURE_OPTS}\n\
              {STREAM_OPTS}\n\
@@ -184,6 +215,8 @@ pub fn help(cmd: Option<&str>) -> String {
              \x20 kaimirror record --fps 10 out.mp4  lighter on the device\n\
              \x20 kaimirror shot screen.png\n\
              \x20 kaimirror shot --display 1 cover.png\n\
-             \x20 kaimirror key DOWN OK\n"),
+             \x20 kaimirror key DOWN OK\n\
+             \x20 kaimirror type                     type live from the terminal\n\
+             \x20 kaimirror type \"hello world\"       type one line and exit\n"),
     }
 }
