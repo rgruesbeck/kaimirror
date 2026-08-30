@@ -418,11 +418,6 @@ A same-key pair costs 1.4 s and a case change ~2 s on top of its presses.
 
 ### Reading the screen as text
 
-**Status: designed and argued below, not yet confirmed on hardware.** No
-device was attached when this was written, so every claim here about what
-*this* build answers is a prediction; `tools/devtools-probe.py` is the one
-run that settles it.
-
 An agent driving the phone through kaimirror has to do it by looking at
 pictures: `shot`, then read the PNG, then guess where the focus ring is.
 That is the slowest and least reliable way to answer "what is on the
@@ -432,69 +427,140 @@ in. What an agent wants instead is what agent-browser's `snapshot` returns:
 a text tree of roles, names and focus, cheap enough to take before every
 action.
 
-That is available here in principle, because **b2g is Gecko**, and Gecko
-already ships the server that answers this question. The dead-end table
-above notes the socket:
+**That works on these devices.** The homescreen reads back as
 
 ```
-/data/local/firefox-debugger-socket     devtools.debugger.remote-enabled=true
+url: http://launcher.localhost/index.html#mainView
+focus: div "PMSundayAug 30"
+
+  div "PMSundayAug 30" [FOCUSED]
+    menuitem "homescreen 2:59 PM, Sunday August 30"
+  button "Notifications"
+  button "Contacts"
 ```
 
-It speaks the Remote Debugging Protocol — the same protocol WebIDE used to
-talk to Firefox OS phones — and it is a *host-side* conversation. Nothing
-in `kaipump` changes, and no new device binary is needed: `adb forward` maps
-the unix socket to a local port and the host talks JSON to it.
+against a screenshot of the same moment showing 2:59 PM, SUNDAY AUG 30 and
+the two soft keys, and the app grid reads back with `menuitem "E-Mail"
+[FOCUSED]` for the icon the screen has selected. It costs **~50 ms** where
+`shot` costs **2.3 s**, and the whole exchange is host-side: `kaipump` is
+untouched, and nothing new goes on the phone.
 
-```sh
-adb forward tcp:6080 localfilesystem:/data/local/firefox-debugger-socket
+`tools/devtools-probe.py` is that snapshot, and the investigation it came
+from.
+
+#### The route
+
+b2g is Gecko, and the dead-end table above notes that Gecko's remote
+debugging server is listening:
+
+```
+$ adb shell ls -l /data/local/firefox-debugger-socket
+srw-rw-rw- 1 root root 0 /data/local/firefox-debugger-socket
 ```
 
-Framing is `<byte-length>:<json>`, the server greets first, and events
-(`tabListChanged`, `consoleAPICall`) arrive interleaved with replies — an
-event carries a `type` and a reply does not, which is the only rule needed
-to tell them apart.
+`adb forward tcp:6080 localfilesystem:/data/local/firefox-debugger-socket`
+maps it to a host port and the rest is JSON over TCP. Framing is
+`<byte-length>:<json>`, the server greets first, and events (`frameUpdate`,
+`tabListChanged`, `consoleAPICall`) arrive interleaved with replies — an
+event carries a `type` and a reply does not, which is the whole rule for
+telling them apart. The root actor's traits place this at a modern devtools
+server, `allowChromeProcess` included:
 
-Three routes sit behind that socket, in decreasing order of how much they
-give and increasing order of how likely they are to be there:
+```
+allowChromeProcess, bulk, heapSnapshots, networkMonitor, perfActorVersion,
+sources, storageInspector, watchpoints, workerConsoleApiMessagesDispatched...
+```
 
-| Route | Gives | Risk |
-|---|---|---|
-| accessibility walker | roles + computed names, straight from Gecko's a11y engine — the closest analogue to a browser snapshot | the engine is a build option; b2g may ship devtools without it, and the actor's shape moved across Gecko versions |
-| inspector's DOM walker | the DOM tree node by node | one round trip per node, which is a lot of round trips for a 240x320 screen |
-| `evaluateJSAsync` on the console actor | whatever a script returns — so, one round trip for the whole snapshot, in exactly the shape we want | none beyond the console actor existing, which is what devtools *is* |
+There is **no `webapps` actor** — the Firefox OS route through
+`getWebapps` / `getAppActor` is gone. It is not needed, because `listTabs`
+already returns one target per running app, each with a console, an
+inspector and an accessibility actor:
 
-The third is the one to build on even if the first works: a snapshot the
-host formats itself can carry the things a KaiOS agent actually needs and a
-generic a11y tree does not — which element has focus (d-pad navigation is
-the whole interaction model), what the two soft keys currently say, and the
-list position within a scroller.
+```
+http://launcher.localhost/index.html#appList     Launcher
+http://callscreen.localhost/index.html#&timestamp=...
+http://notes.localhost/index.html#/list          Notes
+http://camera.localhost/index.html#/             Camera
+http://keyboard.localhost/index.html#{"isFocus":false,...}
+about:blank
+```
 
-Two things are genuinely unknown until the probe runs:
+The system UI is not in that list, and it is not an iframe inside any of
+them either. It is the **parent process** — `chrome://b2g/content/shell.html`,
+reached through `getProcess` with id 0, which is where a chrome-privileged
+console lives.
 
-- **Whether each app is its own target.** KaiOS composes the system app with
-  app frames inside it, so a script evaluated in the system app's window
-  cannot reach the foreground app's document across a process boundary. If
-  `listTabs` returns one target per running app, this is a non-issue; if it
-  returns only the system app, the running apps have to be reached the way
-  Firefox OS exposed them, through a `webapps` actor and `getAppActor`. The
-  probe asks for both.
-- **Whether the accessibility actor is present and enablable.** Firefox OS
-  shipped a screen reader, so the engine was compiled in then; whether this
-  build kept it is a question for the device, not for reasoning.
+Three details cost time, and none of them announce themselves:
 
-What it would buy, beyond the snapshot itself: `imemode`'s calibration walk
-— seven seconds of frame grabs and pixel thresholding, plus the four device
-behaviours documented above that each broke it once — exists only because
-the input mode is currently readable *only* as pixels. The system app draws
-that indicator from its own DOM. Reading it as text would delete the whole
-apparatus.
+- **A target must be attached before its console answers.** An
+  `evaluateJSAsync` sent to a freshly-listed target's `consoleActor` gets
+  no reply and no error — it simply hangs until the socket times out. One
+  `attach` on the target actor first, and the same request answers in
+  milliseconds.
+- **`document.hidden` lies.** The launcher reports `hidden=true` while it is
+  the thing on the panel. `document.hasFocus()` is the honest signal, with
+  one wrinkle: b2g's shell claims focus as well, so a focused *app* has to
+  win over `chrome://`.
+- **A reply larger than ~10k is a `longString` grip**, an actor to call
+  `substring` on rather than the string itself. A snapshot of a busy screen
+  crosses that line.
+
+#### Which of the three routes
+
+| Route | Verdict |
+|---|---|
+| `evaluateJSAsync` on the console actor | **This one.** One round trip returns the whole tree in whatever shape we choose. ~50 ms. |
+| accessibility walker | Works, but only after starting an engine that is off, and it is one round trip *per node*. |
+| inspector's DOM walker | Same per-node round trips, without the computed names. Not pursued. |
+
+The accessibility route is the closest analogue to a browser snapshot, so it
+was taken as far as it goes. Gecko's a11y engine **is** compiled into this
+build — `@mozilla.org/accessibilityService;1` is registered and
+`accessibility.force_disabled` sits at 0 — but the service is not running,
+and the devtools accessibility actor here accepts only
+
+```
+getTraits, bootstrap, getWalker, getSimulator
+```
+
+with no `enable`: the `ParentAccessibilityActor` that Firefox's own panel
+uses to turn the engine on does not exist in this server. Starting it from
+the chrome console does work —
+
+```js
+Cc['@mozilla.org/accessibilityService;1'].getService(Ci.nsIAccessibilityService)
+// Services.appinfo.accessibilityEnabled -> true
+```
+
+— and the walker then answers: `document "Launcher"` → `section` → seven
+children, a request per node. (`accessibility.force_disabled = 1` shuts it
+back down; the probe restores the pref it found.)
+
+So the engine is reachable, and it is still the wrong tool: turning on
+a device-wide a11y engine and then paying a round trip per node, to get
+*less* than a script that already returns everything in one. What the
+script can carry and a generic a11y tree cannot is the part that matters
+here — which element has focus (d-pad navigation is the whole interaction
+model), what the two soft keys currently say, and position within a list.
+
+#### What it would change
+
+`imemode` reads the input-mode indicator by thresholding a 40-pixel crop of
+the status bar, after a ~7 s calibration walk, defended against four device
+behaviours that each broke it once. That exists only because the mode is
+currently readable *only* as pixels. Reading it as text would delete the
+whole apparatus.
 
 The shape it would take is one subcommand alongside `shot`:
 
 ```sh
 kaimirror snapshot            # text tree of the foreground app
-kaimirror snapshot --target N # a specific target, for the system app's chrome
+kaimirror snapshot --target N # a specific target, or b2g's own shell
 ```
+
+The one loose end in the prototype is the visibility test: elements are
+filtered by a viewport-intersection check, and on a transform-scrolled grid
+that keeps a few rows more than the panel actually shows.
 
 ### Dead ends, all tested on the device
 
