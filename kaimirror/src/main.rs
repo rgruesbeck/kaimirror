@@ -18,7 +18,9 @@
 mod adb;
 mod cli;
 mod control;
+mod devtools;
 mod imemode;
+mod json;
 mod keys;
 mod multitap;
 mod sink;
@@ -67,6 +69,7 @@ fn main() {
         "view" => cmd_view(&a),
         "record" => cmd_record(&a),
         "shot" => cmd_shot(&a),
+        "snapshot" => cmd_snapshot(&a),
         "key" => cmd_key(&a),
         "type" => cmd_type(&a),
         "mode" => cmd_mode(&a),
@@ -157,6 +160,47 @@ fn cmd_shot(a: &cli::Args) {
         }
         None => adb::fail("no frames from device (is the panel awake?)"),
     }
+}
+
+/// Print the screen as text rather than as pixels.
+///
+/// The only command that never touches the pump or presses a key: it reads
+/// the running app's own DOM out of Gecko, which is faster than a screenshot
+/// and does not disturb the phone to take one.
+fn cmd_snapshot(a: &cli::Args) {
+    // Reading presses nothing: power *toggles*, and a command that only looks
+    // at the screen has no business changing what is on it.  But a sleeping
+    // phone stops repainting, and its DOM freezes exactly the way its
+    // framebuffer does -- a launcher clock four hours behind the device
+    // clock is what that looks like -- so say so rather than serving stale
+    // text as fresh.
+    if adb::backlight() == 0 {
+        eprintln!("note: the panel is dark, so the phone may have stopped repainting -- \
+                   what follows can be stale (`kaimirror wake` first for a live read)");
+    }
+    let mut conn = devtools::Conn::open(a.port);
+    let targets = conn.targets();
+    if targets.is_empty() {
+        adb::fail("the debugging server lists no windows (is b2g running?)");
+    }
+    if a.list {
+        for (i, t) in targets.iter().enumerate() {
+            let mark = if t.focused { " <- focused" } else { "" };
+            println!("{i}  {:<18} {}{mark}", t.label(), t.url);
+        }
+        return;
+    }
+    let target = match a.target {
+        Some(i) => targets.get(i).unwrap_or_else(|| {
+            adb::fail(&format!(
+                "no target {i}; `kaimirror snapshot --list` shows 0..{}",
+                targets.len() - 1
+            ))
+        }),
+        None => devtools::foreground(&targets).expect("targets is not empty"),
+    };
+    println!("target: {} ({})", target.label(), target.url);
+    println!("{}", conn.snapshot(target));
 }
 
 /// Calibrate the input-mode reader and report what it sees.

@@ -118,6 +118,7 @@ kaimirror view                     # live mirror window (2x, nearest-neighbour)
 kaimirror view --scale 3
 kaimirror record out.mp4           # Ctrl-C to finalize
 kaimirror shot screen.png
+kaimirror snapshot                 # ...or read the screen as text, not pixels
 kaimirror key DOWN OK              # inject key presses
 kaimirror type                     # terminal becomes the phone's keyboard
 kaimirror type "hello world"       # ...or type one line and exit
@@ -255,6 +256,49 @@ Type in the **terminal**, not the mirror window — ffplay keeps its own key
 handling and offers no way to forward keystrokes. A keypress reaches the
 screen in ~240 ms.
 
+## Reading the screen as text
+
+`kaimirror snapshot` prints what is on the screen as a tree of roles, names
+and focus, instead of a picture of it:
+
+```
+$ kaimirror snapshot --target 2
+target: Notes (http://notes.localhost/index.html#/list)
+focus: li "Hello world 2000!"
+
+application "Note Hello world 2000! Date editedDate createdTitleConfirmat"
+  div "Note"
+  li "Hello world 2000!" [FOCUSED]
+    span "Hello world 2000!"
+  button "New"
+  button "Select"
+  button "Options"
+```
+
+That is the form anything scripted wants — an agent especially, which
+otherwise has to take a screenshot and work out where the focus ring is. It
+costs **~50 ms** against the ~2.3 s of a `shot`, and it presses nothing to
+take it.
+
+It is the one command that never touches the device pump. b2g is Gecko, so
+it asks Gecko: the phone's remote debugging socket is forwarded to a local
+port and the app is asked for its own DOM. Bare `kaimirror snapshot` reads
+the app in front; every running app is debuggable, though, and so is b2g's
+own shell:
+
+```sh
+kaimirror snapshot                 # the app in front
+kaimirror snapshot --list          # the debuggable targets, foreground marked
+kaimirror snapshot --target 2      # read one by index, foreground or not
+```
+
+A backgrounded app still answers, which is how the Notes list above was read
+while the phone was showing something else. What no snapshot can do is
+invent a repaint: a sleeping phone stops updating, and its DOM goes stale the
+same way its framebuffer does — a launcher clock four hours behind the device
+clock is what that looks like. `snapshot` says so when the panel is dark;
+`kaimirror wake` first for a live read.
+
 ## Notes
 
 The mirror runs at **~29 fps**, capped by `--fps`; the cap is a choice, not a
@@ -266,7 +310,8 @@ fine over USB, painful over adb-on-wifi — use `--format png` there. `shot`
 always captures PNG, where colour fidelity matters and throughput does not.
 
 If the panel is blanked, captures come back solid black; every command taps
-power first unless you pass `--no-wake`.
+power first unless you pass `--no-wake`. `snapshot` is the exception: it
+reads without pressing anything, and warns instead.
 
 ## Files
 
@@ -276,4 +321,7 @@ power first unless you pass `--no-wake`.
 - `build.sh` — builds both halves on Linux or macOS; `--push` also installs
   the pump, `--dist` builds the release host binary (musl static, or a
   universal binary) and packages `dist/`
+- `tools/devtools-probe.py` — the investigation behind `snapshot`, kept for
+  what the subcommand deliberately does not do: raw protocol dumps, and
+  Gecko's own accessibility walker
 - `docs/INTERNALS.md` — how capture works, the protocol, and the numbers
