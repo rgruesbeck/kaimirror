@@ -24,10 +24,17 @@ pub struct Args {
     pub scale: f64,
     pub control: bool,
     pub list: bool,
+    pub target: Option<usize>,
+    pub port: u16,
     pub positionals: Vec<String>,
 }
 
-const COMMANDS: &[&str] = &["view", "record", "shot", "key", "type", "mode", "wake"];
+const COMMANDS: &[&str] =
+    &["view", "record", "shot", "snapshot", "key", "type", "mode", "wake"];
+
+/// Host port for the forwarded debugging socket.  Only `snapshot` uses it,
+/// and only to have somewhere to put the forward.
+pub const DEFAULT_PORT: u16 = 6080;
 
 fn bad(msg: &str) -> ! {
     eprintln!("error: {msg}");
@@ -39,7 +46,7 @@ pub fn parse(argv: Vec<String>) -> Args {
     let mut a = Args {
         cmd: None, display: 0, no_wake: false, format: "raw".into(),
         fps: DEFAULT_FPS, scale: 2.0, control: false, list: false,
-        positionals: Vec::new(),
+        target: None, port: DEFAULT_PORT, positionals: Vec::new(),
     };
     let mut it = argv.into_iter().peekable();
 
@@ -78,6 +85,17 @@ pub fn parse(argv: Vec<String>) -> Args {
                     v @ ("raw" | "png") => v.to_string(),
                     v => bad(&format!("--format must be raw or png, got {v:?}")),
                 }
+            }
+            "--target" => {
+                let v = value("--target");
+                a.target = Some(v.parse().unwrap_or_else(|_| {
+                    bad(&format!("--target must be an index from `snapshot --list`, got {v:?}"))
+                }));
+            }
+            "--port" => {
+                let v = value("--port");
+                a.port = v.parse().ok().filter(|&n| n > 0)
+                    .unwrap_or_else(|| bad(&format!("--port must be a TCP port, got {v:?}")));
             }
             "--fps" => {
                 let v = value("--fps");
@@ -156,6 +174,33 @@ pub fn help(cmd: Option<&str>) -> String {
              as PNG: one frame is not worth optimising, and PNG keeps more\n\
              colour precision than the RGB565 raw dump.\n\n\
              options:\n{CAPTURE_OPTS}"),
+        Some("snapshot") => format!(
+            "usage: kaimirror snapshot [options]\n\n\
+             Print what is on the screen as text: a tree of roles, names and\n\
+             whatever has focus, which is what an agent wants instead of a\n\
+             screenshot it has to look at.\n\n\
+             This is the one command that does not go through the device pump.\n\
+             b2g is Gecko, so it asks Gecko: the phone's remote debugging\n\
+             socket is forwarded to a local port and the running app is asked\n\
+             for its own DOM.  A snapshot costs ~50ms against the ~2.3s of a\n\
+             shot, and it presses nothing to take it.\n\n\
+             It does not wake the phone either, which is worth knowing: a\n\
+             sleeping device stops repainting, and its DOM goes stale the same\n\
+             way its framebuffer does.  `kaimirror wake` first for a live read;\n\
+             a dark panel is reported.\n\n\
+             By default it reads the app in front.  Every running app is\n\
+             debuggable, though, and so is b2g's own shell -- --list names\n\
+             them and --target reads one by index.\n\n\
+             options:\n\
+             \x20 --list             list the debuggable targets and exit\n\
+             \x20 --target N         snapshot target N from --list instead of\n\
+             \x20                    the foreground app\n\
+             \x20 --port N           host port for the forwarded socket\n\
+             \x20                    (default: {DEFAULT_PORT})\n\n\
+             examples:\n\
+             \x20 kaimirror snapshot\n\
+             \x20 kaimirror snapshot --list\n\
+             \x20 kaimirror snapshot --target 3\n"),
         Some("key") => {
             let names = keys::names();
             let listed = names.chunks(8).map(|c| format!("  {}", c.join(", ")))
@@ -199,6 +244,7 @@ pub fn help(cmd: Option<&str>) -> String {
              \x20 view               live mirror in an ffplay window\n\
              \x20 record OUTPUT      record the screen to a video file\n\
              \x20 shot [OUTPUT]      save a single screenshot\n\
+             \x20 snapshot           print the screen as text, not pixels\n\
              \x20 key KEY [KEY ...]  inject key presses (key --list for names)\n\
              \x20 type [TEXT]        type from the terminal, or type TEXT once\n\
              \x20 wake               tap power to light the panel\n\n\
@@ -215,6 +261,7 @@ pub fn help(cmd: Option<&str>) -> String {
              \x20 kaimirror record --fps 10 out.mp4  lighter on the device\n\
              \x20 kaimirror shot screen.png\n\
              \x20 kaimirror shot --display 1 cover.png\n\
+             \x20 kaimirror snapshot                 read the screen as text\n\
              \x20 kaimirror key DOWN OK\n\
              \x20 kaimirror type                     type live from the terminal\n\
              \x20 kaimirror type \"hello world\"       type one line and exit\n"),

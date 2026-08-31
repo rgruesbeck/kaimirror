@@ -543,24 +543,50 @@ script can carry and a generic a11y tree cannot is the part that matters
 here — which element has focus (d-pad navigation is the whole interaction
 model), what the two soft keys currently say, and position within a list.
 
-#### What it would change
+#### What it changed
 
-`imemode` reads the input-mode indicator by thresholding a 40-pixel crop of
-the status bar, after a ~7 s calibration walk, defended against four device
-behaviours that each broke it once. That exists only because the mode is
-currently readable *only* as pixels. Reading it as text would delete the
-whole apparatus.
+This is `kaimirror snapshot`, and the whole of it is host-side:
+`kaimirror/src/devtools.rs` speaks the protocol, `kaimirror/src/json.rs` is
+the page of JSON it needs to do that. Nothing on the phone changed, and
+nothing new is installed there.
 
-The shape it would take is one subcommand alongside `shot`:
+One structural note, because the naive version is five times slower: requests
+are pipelined a stage at a time — every `getTarget`, then every `attach`,
+then every focus check — since each stage needs the one before it but not
+itself. Seven targets sequentially is seven round trips per stage; this is
+one. A cold `kaimirror snapshot` is **~0.43 s** including `adb root`, the
+forward and attaching everything, and the snapshot inside it is ~50 ms.
 
-```sh
-kaimirror snapshot            # text tree of the foreground app
-kaimirror snapshot --target N # a specific target, or b2g's own shell
-```
+Two things about the output are worth knowing:
 
-The one loose end in the prototype is the visibility test: elements are
-filtered by a viewport-intersection check, and on a transform-scrolled grid
-that keeps a few rows more than the panel actually shows.
+- **Indentation is depth in the printed tree, not in the DOM.** A KaiOS app
+  nests layout wrappers eight deep, and indenting by DOM depth pushes the
+  content off to the right for no information.
+- **A backgrounded app still answers.** Reading a screen the phone is not
+  showing is free here, which the pixel path cannot do at all.
+
+And one it does not fix: a sleeping phone stops repainting, and its DOM
+freezes exactly the way its framebuffer does — the launcher's clock read
+four hours behind the device clock while this was being tested. `snapshot`
+reports a dark panel rather than pretending the text is current. It does not
+tap power to fix it: reading should not change what is on the screen, and
+power *toggles*.
+
+`tools/devtools-probe.py` stays, for the two things the subcommand
+deliberately does not do: dumping the raw protocol exchange (`--raw`), and
+starting the accessibility engine to walk Gecko's own tree (`--a11y`).
+
+#### What it does not touch yet
+
+`imemode` still reads the input-mode indicator by thresholding a 40-pixel
+crop of the status bar, after a ~7 s calibration walk, defended against four
+device behaviours that each broke it once. That exists only because the mode
+was readable *only* as pixels. It is readable as text now — b2g's shell is
+target 6 in `--list` — and moving it over would delete the whole apparatus.
+
+The other loose end is the visibility test: elements are filtered by a
+viewport-intersection check, and on a transform-scrolled grid that keeps a
+few rows more than the panel actually shows.
 
 ### Dead ends, all tested on the device
 

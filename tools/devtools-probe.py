@@ -159,7 +159,10 @@ SNAPSHOT_JS = r"""
                 /^(A|BUTTON|INPUT|SELECT|TEXTAREA|LI|H1|H2|H3)$/.test(el.tagName) ||
                 (kids.length === 0 && label);
     if (worth) out.push('  '.repeat(depth) + role(el) + (label ? ' "' + label + '"' : '') + mark);
-    for (var i = 0; i < kids.length; i++) walk(kids[i], depth + 1);
+    // Indent by depth in the *printed* tree, not in the DOM: the layout
+    // wrappers a KaiOS app nests eight deep say nothing and should cost
+    // nothing to read.
+    for (var i = 0; i < kids.length; i++) walk(kids[i], worth ? depth + 1 : depth);
   }
   walk(document.body, 0);
   var a = document.activeElement;
